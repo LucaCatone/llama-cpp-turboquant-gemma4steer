@@ -183,43 +183,45 @@ struct train_context {
     ggml_context * ctx_ggml;
     int n_embd;
     int n_layers;
+    int n_layers_actual;
 
     /* pair of prompts to be used for generating final vector */
     std::vector<std::string> positive_entries;
     std::vector<std::string> negative_entries;
 
     // each element of the vector correspond to one layer
-    // NOTE: the last layer is discard. therefore, we will have (n_layers - 1) elements here
-    // NOTE (2): v_diff is transposed from v_diff_tmp
-    std::vector<struct ggml_tensor *> v_diff;  // vector of matrices of size [m, n_embd] where m ~ n_tokens * n_completions (v_diff contains no zero-rows)
-    std::vector<struct ggml_tensor *> v_final; // vector of vectors of size [n_embd] to be written to file
+    std::vector<struct ggml_tensor *> v_diff;
+    std::vector<struct ggml_tensor *> v_final;
 
     // to easily re-alloc when concat v_diff, we temporary store v_diff in a vector instead of a tensor
-    // v_diff_tmp will get converted unto v_diff later on
     std::vector<std::vector<uint8_t>> v_diff_tmp;
 
     train_context(int n_embd_, int n_layers_) {
         n_embd = n_embd_;
         n_layers = n_layers_;
+        n_layers_actual = n_layers;
+        // Allocate for max possible layers (n_layers), not n_layers-1
+        // Some models (Gemma 4) include the final output layer
         struct ggml_init_params params_ggml = {
-            /*.mem_size   =*/ ggml_tensor_overhead() * (n_layers - 1) * 2u,
+            /*.mem_size   =*/ ggml_tensor_overhead() * n_layers * 2u,
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
         ctx_ggml = ggml_init(params_ggml);
-        for (int il = 0; il < n_layers - 1; il++) {
+        for (int il = 0; il < n_layers; il++) {
             std::vector<uint8_t> empty;
             v_diff_tmp.push_back(empty);
             auto t = ggml_new_tensor_1d(ctx_ggml, GGML_TYPE_F32, n_embd);
-            t->data = malloc(ggml_nbytes(t)); // TODO: get rid of malloc if possible
+            t->data = malloc(ggml_nbytes(t));
             v_final.push_back(t);
         }
     }
 
-    // add new rows into existing tensor in v_diff_tmp
     void concat_diff_tmp(const std::vector<struct ggml_tensor *> & diff_filtered) {
-        GGML_ASSERT((int) diff_filtered.size() == n_layers - 1);
-        for (int il = 0; il < n_layers - 1; il++) {
+        n_layers_actual = (int) diff_filtered.size();
+        printf("n_layers_actual: %d (model n_layers: %d)\n", n_layers_actual, n_layers);
+        GGML_ASSERT(n_layers_actual <= n_layers);
+        for (int il = 0; il < n_layers_actual; il++) {
             auto t = diff_filtered[il];
             auto & diff_tmp = v_diff_tmp[il];
             size_t curr_size = diff_tmp.size();
@@ -228,11 +230,9 @@ struct train_context {
         }
     }
 
-    // build the v_diff tensors from v_diff_tmp (v_diff need to be transposed)
-    // TODO @ngxson : maybe add option NOT to transpose v_diff; will be useful for "mean" method
     void build_v_diff(bool transpose) {
-        printf("build_v_diff\n");
-        for (int il = 0; il < n_layers - 1; il++) {
+        printf("build_v_diff: %d layers\n", n_layers_actual);
+        for (int il = 0; il < n_layers_actual; il++) {
             auto & diff_tmp = v_diff_tmp[il];
             int n_elem = diff_tmp.size() / sizeof(float);
             GGML_ASSERT(n_elem % n_embd == 0);
@@ -241,9 +241,8 @@ struct train_context {
                 ? ggml_new_tensor_2d(ctx_ggml, GGML_TYPE_F32, n_rows, n_embd)
                 : ggml_new_tensor_2d(ctx_ggml, GGML_TYPE_F32, n_embd, n_rows);
             ggml_set_name(diff, (std::string("diff_") + std::to_string(il)).c_str());
-            diff->data = malloc(ggml_nbytes(diff)); // TODO: get rid of this malloc if possible
+            diff->data = malloc(ggml_nbytes(diff));
             if (transpose) {
-                // copy data & transpose
                 float * arr = (float *) diff_tmp.data();
                 for (int ir = 0; ir < n_rows; ++ir) {
                     for (int ic = 0; ic < n_embd; ++ic) {
@@ -252,12 +251,10 @@ struct train_context {
                     }
                 }
             } else {
-                // only copy
                 memcpy(diff->data, diff_tmp.data(), ggml_nbytes(diff));
             }
             v_diff.push_back(diff);
             print_debug_tensor(diff);
-            // free memory of diff_tmp
             diff_tmp.resize(0);
         }
     }
@@ -265,7 +262,6 @@ struct train_context {
     ~train_context() {
         for (auto ptr : v_final) free(ptr->data);
         for (auto ptr : v_diff) free(ptr->data);
-        // no need to free v_diff_tmp, since we didn't use malloc
         ggml_free(ctx_ggml);
     }
 };
@@ -485,6 +481,10 @@ int main(int argc, char ** argv) {
         // reset for next iteration
         cb_data.reset();
     }
+
+    // Resize to actual number of layers (Gemma 4 may produce n_layers instead of n_layers-1)
+    ctx_train.v_final.resize(ctx_train.n_layers_actual);
+    ctx_train.v_diff_tmp.resize(ctx_train.n_layers_actual);
 
     // done with the model, we can now free it to make gain some memory
     printf("Done evaluate prompts, unload model...\n");
