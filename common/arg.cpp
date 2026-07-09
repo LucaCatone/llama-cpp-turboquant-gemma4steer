@@ -3335,6 +3335,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
     add_opt(common_arg(
+        {"--response-only"},
+        "only use model response tokens (after <start_of_turn>model) in the mean, excludes user prompt tokens",
+        [](common_params & params) {
+            params.cvector_response_only = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
         {"--output-format"}, "{md,jsonl}",
         "output format for batched-bench results (default: md)",
         [](common_params & params, const std::string & value) {
