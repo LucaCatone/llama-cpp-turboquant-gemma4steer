@@ -692,6 +692,7 @@ struct common_params {
     dimre_method cvector_dimre_method = DIMRE_METHOD_PCA;
     std::string cvector_positive_file = "tools/cvector-generator/positive.txt";
     std::string cvector_negative_file = "tools/cvector-generator/negative.txt";
+    bool cvector_response_only = false;
 
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
 
