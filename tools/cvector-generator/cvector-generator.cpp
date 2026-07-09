@@ -535,7 +535,8 @@ int main(int argc, char ** argv) {
         PCA::run_pca(pca_params, ctx_train.v_diff, ctx_train.v_final);
     } else {
         // run mean
-        mean::run(ctx_train.v_diff, ctx_train.v_final);
+        mean::layer_report report;
+        mean::run(ctx_train.v_diff, ctx_train.v_final, &report);
     }
 
     // write output vectors to gguf
