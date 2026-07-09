@@ -163,31 +163,6 @@ llama-quantize model.f16.gguf model.tq4_1s.gguf TQ4_1S
 llama-quantize model.f16.gguf model.tq3_1s.gguf TQ3_1S
 ```
 
-### Server slot save/restore across restarts
-
-`llama-server` can persist a slot's KV state to disk and reload it later, including across a full process restart:
-
-```bash
-# start the server with a save path and context checkpoints enabled
-llama-server -m model.gguf --slot-save-path /path/to/slots --ctx-checkpoints 8
-
-# save slot 0 to disk
-curl -X POST 'http://localhost:8080/slots/0?action=save' \
-  -H 'Content-Type: application/json' -d '{"filename": "session1.bin"}'
-
-# ... restart the server ...
-
-# restore slot 0 from disk in the new process
-curl -X POST 'http://localhost:8080/slots/0?action=restore' \
-  -H 'Content-Type: application/json' -d '{"filename": "session1.bin"}'
-```
-
-Saving also writes a `session1.bin.ckpt` sidecar next to the state file, carrying the slot's in-memory context checkpoints (upstream's `llama_state_seq_save_file` only serializes tokens + KV cells, not checkpoints — they otherwise exist only in process memory and are lost across a restart). Restoring loads the sidecar back in, so a request that rolls back mid-prompt after a restore (e.g. a BPE re-tokenization at the tail of a long conversation) can resume from a checkpoint instead of forcing a full re-prefill.
-
-**This only matters for SWA or hybrid/recurrent-memory models** (Gemma-style sliding-window attention, Mamba/hybrid architectures). Plain dense-attention models never evict early KV positions, so the server can always truncate the cache to an earlier point directly — the checkpoint/rollback path is unreachable for them regardless of this feature, with or without a restart in between.
-
-If a state file has no sidecar (saved by an older build, or the file was moved on its own), restore falls back to synthesizing a single checkpoint from the tail of the restored state. That covers an exact-append continuation but not a deeper rollback, which degrades to a full re-prefill — the same behavior as before this feature existed, not a regression.
-
 ### Automatic behavior
 
 The following activate based on the selected types — no flags required:
@@ -775,6 +750,46 @@ let package = Package(
 ```
 The above example is using an intermediate build `b5046` of the library. This can be modified
 to use a different version by changing the URL and checksum.
+
+## Patches & Customizations (Miro fork)
+
+This fork includes two patches to `cvector-generator` for personalità steering
+via activation vectors on Gemma 4.
+
+### Patch 1: Gemma 4 layer count
+
+`tools/cvector-generator/cvector-generator.cpp`
+
+Gemma 4 26B produces 30 `l_out` tensors instead of `n_layers - 1` (47). The
+original assertion `GGML_ASSERT(diff_filtered.size() == n_layers - 1)` crashes.
+Fix: use `n_layers_actual` (the real count) throughout.
+
+Changes:
+- Allocate `train_context` for `n_layers` instead of `n_layers - 1`
+- Use `diff_filtered.size()` as `n_layers_actual` in `concat_diff_tmp`
+- Resize `v_final` and `v_diff_tmp` after the loop instead of pre-allocating
+- Iterate over `n_layers_actual` in `build_v_diff`
+
+### Patch 2: `--response-only` flag
+
+`common/common.h`, `common/arg.cpp`, `tools/cvector-generator/cvector-generator.cpp`
+
+By default, `cvector-generator` averages hidden state diffs across ALL tokens
+(prompt + response). The user-turn tokens are identical between positive and
+negative pairs, so their diff is ~0 — diluting the signal. The `--response-only`
+flag zeroes out prompt token positions before `filter_nonzero_rows` removes them,
+so only model-response tokens contribute to the mean vector.
+
+Usage:
+```bash
+llama-cvector-generator \
+  -m model.gguf \
+  --method mean \
+  --response-only \
+  -p positive_prompts.txt \
+  -n negative_prompts.txt \
+  -o control_vector.gguf
+```
 
 ## Completions
 Command-line completion is available for some environments.
