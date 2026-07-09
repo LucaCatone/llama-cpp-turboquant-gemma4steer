@@ -34,6 +34,49 @@ This fork's TurboQuant integration is used in:
 
 ---
 
+## Patches & Customizations
+
+This fork includes two patches to `cvector-generator` for personalità steering
+via activation vectors on Gemma 4.
+
+### Patch 1: Gemma 4 layer count
+
+`tools/cvector-generator/cvector-generator.cpp`
+
+Gemma 4 26B produces 30 `l_out` tensors instead of `n_layers - 1` (47). The
+original assertion `GGML_ASSERT(diff_filtered.size() == n_layers - 1)` crashes.
+Fix: use `n_layers_actual` (the real count) throughout.
+
+Changes:
+- Allocate `train_context` for `n_layers` instead of `n_layers - 1`
+- Use `diff_filtered.size()` as `n_layers_actual` in `concat_diff_tmp`
+- Resize `v_final` and `v_diff_tmp` after the loop instead of pre-allocating
+- Iterate over `n_layers_actual` in `build_v_diff`
+
+### Patch 2: `--response-only` flag
+
+`common/common.h`, `common/arg.cpp`, `tools/cvector-generator/cvector-generator.cpp`
+
+By default, `cvector-generator` averages hidden state diffs across ALL tokens
+(prompt + response). The user-turn tokens are identical between positive and
+negative pairs, so their diff is ~0 — diluting the signal. The `--response-only`
+flag zeroes out prompt token positions before `filter_nonzero_rows` removes them,
+so only model-response tokens contribute to the mean vector.
+
+Usage:
+```bash
+llama-cvector-generator \
+  -m model.gguf \
+  --method mean \
+  --response-only \
+  -p positive_prompts.txt \
+  -n negative_prompts.txt \
+  -o control_vector
+.gguf
+```
+
+---
+
 ## What this fork adds
 
 ### Quantization types
@@ -776,45 +819,6 @@ let package = Package(
 The above example is using an intermediate build `b5046` of the library. This can be modified
 to use a different version by changing the URL and checksum.
 
-## Patches & Customizations (Miro fork)
-
-This fork includes two patches to `cvector-generator` for personalità steering
-via activation vectors on Gemma 4.
-
-### Patch 1: Gemma 4 layer count
-
-`tools/cvector-generator/cvector-generator.cpp`
-
-Gemma 4 26B produces 30 `l_out` tensors instead of `n_layers - 1` (47). The
-original assertion `GGML_ASSERT(diff_filtered.size() == n_layers - 1)` crashes.
-Fix: use `n_layers_actual` (the real count) throughout.
-
-Changes:
-- Allocate `train_context` for `n_layers` instead of `n_layers - 1`
-- Use `diff_filtered.size()` as `n_layers_actual` in `concat_diff_tmp`
-- Resize `v_final` and `v_diff_tmp` after the loop instead of pre-allocating
-- Iterate over `n_layers_actual` in `build_v_diff`
-
-### Patch 2: `--response-only` flag
-
-`common/common.h`, `common/arg.cpp`, `tools/cvector-generator/cvector-generator.cpp`
-
-By default, `cvector-generator` averages hidden state diffs across ALL tokens
-(prompt + response). The user-turn tokens are identical between positive and
-negative pairs, so their diff is ~0 — diluting the signal. The `--response-only`
-flag zeroes out prompt token positions before `filter_nonzero_rows` removes them,
-so only model-response tokens contribute to the mean vector.
-
-Usage:
-```bash
-llama-cvector-generator \
-  -m model.gguf \
-  --method mean \
-  --response-only \
-  -p positive_prompts.txt \
-  -n negative_prompts.txt \
-  -o control_vector.gguf
-```
 
 ## Completions
 Command-line completion is available for some environments.
