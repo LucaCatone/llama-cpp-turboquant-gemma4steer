@@ -60,7 +60,9 @@ struct callback_data {
 
     int n_layers = 0;
     int n_tokens = 0;
+    int n_prompt_tokens = 0;    // tokens to exclude from diff when response_only
     bool is_eval_pos = true;
+    bool response_only = false; // only average model response tokens
 
     // each element of the vector correspond to one layer
     std::vector<struct ggml_tensor *> v_pos; // vector of matrices of size [n_embd, n_tokens]
@@ -106,6 +108,14 @@ struct callback_data {
             size_t n_elem = ggml_nelements(v_pos[il]);
             for (size_t j = 0; j < n_elem; j++) {
                 a[j] -= b[j];
+            }
+            // zero out prompt token diffs so filter_nonzero_rows excludes them
+            if (response_only && n_prompt_tokens > 0) {
+                int n_embd = v_pos[il]->ne[0];
+                size_t n_zero = (size_t)n_embd * n_prompt_tokens;
+                if (n_zero <= n_elem) {
+                    memset(a, 0, n_zero * sizeof(float));
+                }
             }
             //print_debug_tensor(v_pos[i]);
             auto diff_filtered = filter_nonzero_rows(v_pos[il]);
@@ -322,6 +332,24 @@ static std::vector<std::string> ctrlvec_load_prompt_file(std::string path, bool 
 
 //////////////////////////////////////////////////
 
+// Tokenize the prefix up to the model response start, return token count
+static int get_prompt_token_count(llama_context * ctx, const std::string & entry) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+
+    std::string model_tag = "<start_of_turn>model";
+    size_t model_pos = entry.find(model_tag);
+    if (model_pos == std::string::npos) {
+        // fallback: no model tag found, use entire entry
+        return (int) common_tokenize(ctx, entry, add_bos, true).size();
+    }
+    std::string prefix = entry.substr(0, model_pos);
+    return (int) common_tokenize(ctx, prefix, add_bos, true).size();
+}
+
+//////////////////////////////////////////////////
+
 static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cb_data = (callback_data *) user_data;
     static const char * l_out_name = "l_out";
@@ -457,6 +485,10 @@ int main(int argc, char ** argv) {
         tokenized_prompt t = tokenized_prompts[i];
         cb_data.n_layers = n_layers;
         cb_data.n_tokens = t.max_seq_len;
+        cb_data.response_only = params.cvector_response_only;
+        if (cb_data.response_only) {
+            cb_data.n_prompt_tokens = get_prompt_token_count(ctx, ctx_train.positive_entries[i]);
+        }
 
         printf("Evaluating prompt[%d/%d]: \"%s\" - \"%s\" (%d tokens)\n",
             (int) i+1, (int) ctx_train.positive_entries.size(),
