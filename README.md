@@ -903,12 +903,55 @@ LLAMA_API int32_t llama_set_kv_bank(
 
 // Process memory text, extract top-k layers by K norm, load as KV bank.
 // n_layers: how many top layers to select.
-// Clears the KV cache after extraction. Returns 0 on success.
+// Returns 0 on success. Does NOT clear the existing KV cache (bank K/V
+// is concatenated on top of cache K/V in the attention graph).
 LLAMA_API int32_t llama_inject_memory(
         struct llama_context * ctx,
                  const char * memory_text,
                      int32_t   n_layers);
 ```
+
+### Supported architectures
+
+- Standard dense attention (via `llama_kv_cache`): fully tested (SmolLM2).
+- Hybrid attention (via `llama_memory_hybrid`): uses `get_mem_attn()`.
+- ISWA (via `llama_kv_cache_iswa`, e.g. Gemma 4): uses `get_base()`.
+
+### Cache layout detection
+
+`extract_layer_kv()` auto-detects tensor layout:
+- **Collapsed** (turbo-quant): `ggml_tensor` shape `(n_embd_head*n_kv_heads, kv_size)`
+- **Separated** (standard): `ggml_tensor` shape `(n_embd_head, n_kv_heads, kv_size)`
+
+The heuristic uses `ne[1] > 256` to distinguish (kv_size vs n_kv_heads).
+
+### already_rotated flag
+
+Bank layers extracted from cache are already post-RoPE and post-WHT (turbo-quant). The `already_rotated` flag on `llama_kv_bank::bank_layer` tells the injection graph code to skip:
+- `k_rot` / `v_rot` (RoPE de/re-rotation)
+- WHT (Walsh-Hadamard Transform) rotation
+
+This prevents double-rotation when bank data is sourced from the KV cache rather than computed from the residual stream.
+
+### HTTP endpoints
+
+The `llama-server` exposes two endpoints (in addition to the standard `/v1/*` API):
+
+| Endpoint | Method | Body | Returns |
+|---|---|---|---|
+| `/kv-bank` | POST | `{"n_embd_head":N,"n_kv_heads":N,"layers":[...]}` | `{"return":0}` |
+| `/kv-bank-inject` | POST | `{"memory":"...","n_layers":5}` | `{"return":0}` |
+
+`/kv-bank-inject` runs a forward pass on the memory text, extracts the top-k layers by K norm (mean absolute value), and loads them as the working KV bank. The next completion request will attend to bank slots concatenated before the current cache.
+
+## Changelog (KV bank injection)
+
+- **2026-07-11**: Fix cache layout detection for turbo-quant 3D/2D tensors.
+  Fix `extract_layer_kv` to handle collapsed head×kv dimensions.
+  Add `n_cells` parameter to limit extraction to filled positions.
+  Add ISWA memory type support (Gemma 4).
+  Add `already_rotated` flag to skip RoPE/WHT transforms.
+  Remove `memory->clear(false)` from inject_memory to avoid slot tracking breakage.
 
 ## Dependencies
 
