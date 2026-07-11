@@ -701,6 +701,31 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // Apply a KV bank to a llama_context, or if data is NULL, clear
+    // the currently loaded bank.
+    // data encodes the KV bank layers concatenated. Format for each layer:
+    //   [il (int32), n_slots (int32), k_flat (float[]), v_flat (float[])]
+    //   k_flat size: n_embd_head * n_kv_heads * n_slots
+    //   v_flat size: n_embd_head * n_kv_heads * n_slots
+    // len is the total number of float values in data (not bytes).
+    // n_embd_head and n_kv_heads describe the model dimensions.
+    // Returns 0 on success, -1 on failure.
+    LLAMA_API int32_t llama_set_kv_bank(
+            struct llama_context * ctx,
+                     const float * data,
+                          size_t   len,
+                         int32_t   n_embd_head,
+                         int32_t   n_kv_heads);
+
+    // Process memory text, extract top-k layers by K norm, load as KV bank.
+    // Clears the KV cache after extraction.
+    // n_layers: how many top layers to select (by K norm mean).
+    // Returns 0 on success, -1 on failure.
+    LLAMA_API int32_t llama_inject_memory(
+            struct llama_context * ctx,
+                     const char * memory_text,
+                         int32_t   n_layers);
+
     //
     // Memory
     //

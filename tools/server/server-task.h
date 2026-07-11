@@ -27,6 +27,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_SET_KV_BANK,
+    SERVER_TASK_TYPE_INJECT_MEMORY,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -172,6 +174,16 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_SET_KV_BANK
+    std::vector<float> set_kv_bank_data;
+    int32_t set_kv_bank_embd_head = 0;
+    int32_t set_kv_bank_kv_heads  = 0;
+
+    // used by SERVER_TASK_TYPE_INJECT_MEMORY
+    std::string inject_memory_text;
+    int32_t     inject_n_layers = 5;
+    int32_t     inject_result = -1;
 
     server_task() = default;
 

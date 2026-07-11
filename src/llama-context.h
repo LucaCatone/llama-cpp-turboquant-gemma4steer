@@ -129,6 +129,18 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
+    bool set_kv_bank(
+            const float * data,
+                 size_t   len,
+                int32_t   n_embd_head,
+                int32_t   n_kv_heads);
+
+    // Inject memory: forward the text, extract top-n_layers by K norm, load as kv_bank.
+    // Clears the KV cache after extraction.
+    bool inject_memory(
+            const char * memory_text,
+                int32_t   n_layers);
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
@@ -278,6 +290,7 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+    llama_kv_bank_ptr       kv_bank;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

@@ -600,6 +600,7 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_kv_bank          * kv_bank;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -619,6 +620,8 @@ struct llm_graph_params {
         }
         return true;
     }
+
+    int32_t  n_extra_nodes; // extra graph nodes beyond model topology (e.g. kv_bank injection)
 
     uint32_t n_outputs;
 
@@ -687,9 +690,11 @@ struct llm_graph_params {
             cparams.causal_attn == other.cparams.causal_attn &&
             arch  == other.arch  &&
             gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+            cvec        == other.cvec        &&
+            loras       == other.loras       &&
+            kv_bank     == other.kv_bank     &&
+            n_extra_nodes == other.n_extra_nodes &&
+            cross       == other.cross;
     }
 };
 
@@ -811,6 +816,7 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const int32_t n_extra_nodes;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;
@@ -822,6 +828,7 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_kv_bank          * kv_bank;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -846,6 +853,22 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    // Concatenate KV bank slots to the cache K/V at layer il.
+    // Modifies k, v, and kq_mask in-place (via pointer reference).
+    // innerq_scale: needed for WHT rotation when cache uses TurboQuant. NULL = no rotation.
+    // k_rot, v_rot: pre-computed rotation matrices for pre-RoPE bank keys/values.
+    //   If non-NULL, the function applies ggml_mul_mat_aux to the bank tensors
+    //   (same rotation applied to Q and K/V in the forward pass).
+    //   Pass NULL when no rotation is needed (e.g. non-rotated models).
+    void build_kv_bank_injection(
+            ggml_tensor *& k,
+            ggml_tensor *& v,
+            ggml_tensor *& kq_mask,
+            ggml_tensor *  innerq_scale,
+                    int    il,
+            ggml_tensor *  k_rot = nullptr,
+            ggml_tensor *  v_rot = nullptr) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(

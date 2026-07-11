@@ -1479,6 +1479,116 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+int32_t llama_kv_cache::extract_layer_kv(
+        int32_t model_il,
+        float * k_out,
+        float * v_out,
+        int32_t n_embd_head,
+        int32_t n_kv_heads) const {
+    auto it = map_layer_ids.find(model_il);
+    if (it == map_layer_ids.end()) return 0;
+    int32_t ikv = it->second;
+    if (ikv < 0 || ikv >= (int32_t)layers.size()) return 0;
+
+    ggml_tensor * k_t = layers[ikv].k_stream.empty() ? layers[ikv].k : layers[ikv].k_stream[0];
+    ggml_tensor * v_t = layers[ikv].v_stream.empty() ? layers[ikv].v : layers[ikv].v_stream[0];
+    if (!k_t || !v_t) return 0;
+
+    int32_t n_cells = (int32_t)k_t->ne[2];
+    size_t k_nb = ggml_nbytes(k_t);
+    size_t v_nb = ggml_nbytes(v_t);
+    std::vector<uint8_t> k_raw(k_nb), v_raw(v_nb);
+    ggml_backend_tensor_get(k_t, k_raw.data(), 0, k_nb);
+    ggml_backend_tensor_get(v_t, v_raw.data(), 0, v_nb);
+
+    auto dequant = [&](const std::vector<uint8_t> & raw, ggml_type type, float * out, int n) {
+        if (type == GGML_TYPE_F32) { memcpy(out, raw.data(), n * sizeof(float)); return; }
+        if (type == GGML_TYPE_F16) {
+            const ggml_fp16_t * fp = (const ggml_fp16_t *)raw.data();
+            for (int i = 0; i < n; i++) out[i] = ggml_fp16_to_fp32(fp[i]);
+            return;
+        }
+        const auto * tt = ggml_get_type_traits(type);
+        if (tt && tt->to_float) {
+            int bs = ggml_blck_size(type);
+            int nb = n / bs;
+            for (int b = 0; b < nb; b++)
+                tt->to_float(raw.data() + b * ggml_type_size(type), out + b * bs, bs);
+            int r = n - nb * bs;
+            if (r > 0) memset(out + nb * bs, 0, r * sizeof(float));
+        } else {
+            memcpy(out, raw.data(), n * sizeof(float));
+        }
+    };
+
+    int k_elems = (int)(k_t->ne[0] * k_t->ne[1] * k_t->ne[2]);
+    int v_elems = (int)(v_t->ne[0] * v_t->ne[1] * (size_t)v_t->ne[2] * v_t->ne[3]);
+    std::vector<float> k_f32(k_elems), v_f32(v_elems);
+    dequant(k_raw, k_t->type, k_f32.data(), k_elems);
+    dequant(v_raw, v_t->type, v_f32.data(), v_elems);
+
+    int heff = (int)k_t->ne[0], nkv = (int)k_t->ne[1];
+    size_t idx = 0;
+    for (int s = 0; s < n_cells; s++)
+        for (int kv = 0; kv < nkv && kv < n_kv_heads; kv++)
+            for (int h = 0; h < heff && h < n_embd_head; h++)
+                k_out[idx++] = k_f32[h + kv * heff + s * heff * nkv];
+    // V extraction (simplified: same layout)
+    int vhe = (int)v_t->ne[0], vnk = (int)v_t->ne[1];
+    size_t vidx = 0;
+    for (int s = 0; s < n_cells; s++)
+        for (int kv = 0; kv < vnk && kv < n_kv_heads; kv++)
+            for (int h = 0; h < vhe && h < n_embd_head; h++)
+                v_out[vidx++] = v_f32[h + kv * vhe + s * vhe * vnk];
+
+    return n_cells;
+}
+
+float llama_kv_cache::get_layer_k_norm(int32_t model_il) const {
+    auto it = map_layer_ids.find(model_il);
+    if (it == map_layer_ids.end()) return -1.0f;
+    int32_t ikv = it->second;
+    if (ikv < 0 || ikv >= (int32_t)layers.size()) return -1.0f;
+
+    ggml_tensor * t = layers[ikv].k_stream.empty() ? layers[ikv].k : layers[ikv].k_stream[0];
+    if (!t) return -1.0f;
+
+    size_t nbytes = ggml_nbytes(t);
+    // For quantized types, estimate from raw bytes
+    if (t->type == GGML_TYPE_F32) {
+        std::vector<float> buf(ggml_nelements(t));
+        ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+        double sum = 0;
+        for (auto v : buf) sum += fabs(v);
+        return (float)(sum / buf.size());
+    }
+    if (t->type == GGML_TYPE_F16) {
+        size_t ne = ggml_nelements(t);
+        std::vector<ggml_fp16_t> buf(ne);
+        ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+        double sum = 0;
+        for (auto v : buf) sum += fabs(ggml_fp16_to_fp32(v));
+        return (float)(sum / ne);
+    }
+    // For quantized types: rough estimate from block magnitudes
+    const auto * tt = ggml_get_type_traits(t->type);
+    if (tt && tt->to_float) {
+        int bs = ggml_blck_size(t->type);
+        size_t ne = ggml_nelements(t);
+        size_t nb = ne / bs;
+        std::vector<float> buf(bs);
+        const char * data = nullptr;
+        // Read first block only for estimation
+        std::vector<uint8_t> raw(ggml_type_size(t->type));
+        ggml_backend_tensor_get(t, raw.data(), 0, ggml_type_size(t->type));
+        tt->to_float((const char *)raw.data(), buf.data(), bs);
+        double sum = 0;
+        for (auto v : buf) sum += fabs(v);
+        return (float)(sum / bs);
+    }
+    return -1.0f;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 

@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+struct llama_context;
+
 struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
@@ -223,7 +225,29 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // Extract K/V data from a model layer as float arrays.
+    // k_out, v_out: caller-allocated buffers (n_embd_head * n_kv_heads * n_slots * sizeof(float))
+    // Returns the number of slots extracted, or 0 if layer not found.
+    int32_t extract_layer_kv(
+            int32_t model_il,
+            float * k_out,
+            float * v_out,
+            int32_t n_embd_head,
+            int32_t n_kv_heads) const;
+
+    // Get a quick mean(|K|) norm for a model layer (used for layer selection).
+    // Returns negative on error, else the mean absolute value of K.
+    float get_layer_k_norm(int32_t model_il) const;
+
+    // Get total number of cache layers.
+    int32_t get_n_cache_layers() const { return (int32_t)layers.size(); }
+
+    // Get model layer id for a cache layer index.
+    int32_t get_cache_layer_il(int32_t idx) const { return (int32_t)layers[idx].il; }
+
 private:
+    friend struct llama_context;
+
     const llama_model & model;
     const llama_hparams & hparams;
 

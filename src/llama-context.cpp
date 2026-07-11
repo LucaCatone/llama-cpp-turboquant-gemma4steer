@@ -6,6 +6,8 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -13,6 +15,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -453,9 +456,10 @@ void llama_context::sched_reserve() {
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(n_tokens) +
+        (kv_bank ? kv_bank->layers.size() * 16 : 0);
 
-    LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+    LLAMA_LOG_DEBUG("%s: max_nodes = %zu (kv_bank=%zu)\n", __func__, max_nodes, kv_bank ? kv_bank->layers.size() * 16 : 0);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -2406,9 +2410,11 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.kv_bank     =*/ kv_bank.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.n_extra_nodes =*/ kv_bank ? (int32_t)(kv_bank->layers.size() * 16) : 0,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3835,6 +3841,223 @@ int32_t llama_set_adapter_cvec(
               int32_t   il_end) {
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
 
+    return res ? 0 : -1;
+}
+
+bool llama_context::set_kv_bank(
+            const float * data,
+                 size_t   len,
+                int32_t   n_embd_head,
+                int32_t   n_kv_heads) {
+    // clear existing bank
+    if (data == nullptr || len == 0) {
+        kv_bank.reset();
+        sched_need_reserve = true;
+        return true;
+    }
+
+    auto bank = std::make_shared<llama_kv_bank>();
+    bank->n_embd_head = n_embd_head;
+    bank->n_kv_heads  = n_kv_heads;
+
+    size_t pos = 0;
+    while (pos < len) {
+        llama_kv_bank::bank_layer layer;
+
+        // Read header: il, n_slots
+        if (pos + 2 > len) {
+            LLAMA_LOG_ERROR("%s: truncated header\n", __func__);
+            return false;
+        }
+        const int32_t * header = (const int32_t *)(data + pos);
+        layer.il      = header[0];
+        layer.n_slots = header[1];
+        pos += 2;
+
+        size_t slot_size = (size_t)n_embd_head * n_kv_heads * layer.n_slots;
+        if (pos + 2 * slot_size > len) {
+            LLAMA_LOG_ERROR("%s: truncated data for layer %d (needs %zu floats, have %zu)\n",
+                __func__, layer.il, 2 * slot_size, len - pos);
+            return false;
+        }
+
+        layer.k_data.assign(data + pos, data + pos + slot_size);
+        pos += slot_size;
+        layer.v_data.assign(data + pos, data + pos + slot_size);
+        pos += slot_size;
+
+        bank->layers.push_back(std::move(layer));
+    }
+
+    // Pre-allocate ggml tensors for each bank layer
+    // These live in a dedicated ggml_context inside the bank
+    {
+        size_t n_tensors = bank->layers.size() * 2;
+        size_t data_bytes = 0;
+        for (auto & layer : bank->layers) {
+            data_bytes += (size_t)n_embd_head * n_kv_heads * layer.n_slots * sizeof(float) * 2; // K + V
+        }
+        size_t mem_size = ggml_tensor_overhead() * n_tensors + data_bytes + 4096;
+        bank->ctx = ggml_init({mem_size, NULL, /*no_alloc=*/false});
+        if (!bank->ctx) {
+            LLAMA_LOG_ERROR("%s: failed to init ggml context\n", __func__);
+            return false;
+        }
+        for (auto & layer : bank->layers) {
+            int64_t ne[] = {n_embd_head, n_kv_heads, layer.n_slots, 1};
+            layer.k_tensor = ggml_new_tensor_4d(bank->ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+            layer.v_tensor = ggml_new_tensor_4d(bank->ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+            if (!layer.k_tensor || !layer.v_tensor) {
+                LLAMA_LOG_ERROR("%s: failed to allocate bank tensors\n", __func__);
+                return false;
+            }
+            // Copy data directly into the ggml context buffer
+            memcpy(layer.k_tensor->data, layer.k_data.data(), layer.k_data.size() * sizeof(float));
+            memcpy(layer.v_tensor->data, layer.v_data.data(), layer.v_data.size() * sizeof(float));
+        }
+    }
+
+    kv_bank = std::move(bank);
+    sched_need_reserve = true;
+
+    LLAMA_LOG_DEBUG("%s: loaded %zu layers\n", __func__, kv_bank->layers.size());
+    return true;
+}
+
+bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
+    // 1. Tokenize
+    const llama_vocab * vocab = llama_model_get_vocab(&model);
+    int n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), NULL, 0, true, false);
+    if (n_tok <= 0) { LLAMA_LOG_ERROR("%s: tokenization failed\n", __func__); return false; }
+    std::vector<llama_token> tokens(n_tok);
+    n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), tokens.data(), n_tok, true, false);
+    if (n_tok <= 0) return false;
+
+    // 2. Forward pass
+    llama_batch batch = llama_batch_get_one(tokens.data(), n_tok);
+    batch.logits = (int8_t *)calloc((size_t)n_tok, 1);
+    batch.logits[n_tok - 1] = 1;
+    int ret = llama_decode(this, batch);
+    free(batch.logits);
+    if (ret != 0) { LLAMA_LOG_ERROR("%s: decode failed\n", __func__); return false; }
+
+    // 3. Access KV cache
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    if (!kv) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        if (hybrid) kv = hybrid->get_mem_attn();
+    }
+    if (!kv) { LLAMA_LOG_ERROR("%s: unsupported memory type\n", __func__); return false; }
+
+    int n_cl = kv->get_n_cache_layers();
+    if (n_cl <= 0) return false;
+
+    // 4. Get model dimensions via model.hparams
+    auto & hp = model.hparams;
+    int n_embd_head = (int)hp.n_embd_head_k(0);
+    int n_kv_h = (int)hp.n_head_kv(0);
+
+    // 5. Extract K/V from all non-SWA layers, compute norm for ranking
+    struct LS { int32_t il; float score; int32_t n_slots; };
+    std::vector<LS> layers_info;
+
+    for (int i = 0; i < n_cl; i++) {
+        int32_t mil = kv->get_cache_layer_il(i);
+        // Skip SWA layers (they usually have different head count)
+        if (hp.is_swa(mil)) continue;
+
+        // Get n_slots from the cache tensor
+        auto it = kv->map_layer_ids.find(mil);
+        if (it == kv->map_layer_ids.end()) continue;
+        int32_t ikv = it->second;
+        if (ikv < 0 || ikv >= n_cl) continue;
+        int32_t ns = kv->layers[ikv].k ? (int32_t)kv->layers[ikv].k->ne[2] : 0;
+        if (ns <= 0) continue;
+
+        // Get per-layer head dims
+        int nh = (int)hp.n_embd_head_k(mil);
+        int nkv_hp = (int)hp.n_head_kv(mil);
+        if (nh <= 0 || nkv_hp <= 0) continue;
+
+        n_embd_head = nh;
+        n_kv_h = nkv_hp;
+
+        // Extract + compute norm
+        size_t sz = (size_t)nh * nkv_hp * ns;
+        std::vector<float> k_buf(sz), v_buf(sz);
+        int got = kv->extract_layer_kv(mil, k_buf.data(), v_buf.data(), nh, nkv_hp);
+        if (got != ns) continue;
+
+        double sum = 0;
+        for (auto x : k_buf) sum += fabs(x);
+        float sc = (float)(sum / k_buf.size());
+
+        layers_info.push_back({mil, sc, ns});
+    }
+
+    if (layers_info.empty()) {
+        LLAMA_LOG_ERROR("%s: no valid layers found\n", __func__);
+        return false;
+    }
+
+    // 6. Sort by score, take top-n_layers
+    std::sort(layers_info.begin(), layers_info.end(),
+        [](const LS & a, const LS & b) { return a.score > b.score; });
+    LLAMA_LOG_INFO("%s: %d candidate layers, picking top %d\n", __func__,
+        (int)layers_info.size(), n_layers);
+    for (int i = 0; i < n_layers && i < (int)layers_info.size(); i++) {
+        LLAMA_LOG_INFO("  layer %3d score=%8.4f slots=%d\n",
+            layers_info[i].il, (double)layers_info[i].score, layers_info[i].n_slots);
+    }
+    if ((int32_t)layers_info.size() > n_layers)
+        layers_info.resize(n_layers);
+
+    // 7. Build flat bank data
+    std::vector<float> flat;
+    for (auto & li : layers_info) {
+        int32_t ns = li.n_slots;
+        int nh = (int)hp.n_embd_head_k(li.il);
+        int nkv_hp = (int)hp.n_head_kv(li.il);
+        size_t sz = (size_t)nh * nkv_hp * ns;
+
+        float f_il, f_ns;
+        memcpy(&f_il, &li.il, sizeof(float));
+        memcpy(&f_ns, &ns, sizeof(float));
+        flat.push_back(f_il);
+        flat.push_back(f_ns);
+
+        size_t off = flat.size();
+        flat.resize(off + 2 * sz);
+        int got = kv->extract_layer_kv(li.il, flat.data() + off, flat.data() + off + sz, nh, nkv_hp);
+        if (got != ns) {
+            flat.resize(off - 2);
+        }
+        n_embd_head = nh;
+        n_kv_h = nkv_hp;
+    }
+
+    if (flat.empty()) { LLAMA_LOG_ERROR("%s: empty bank\n", __func__); return false; }
+
+    // 8. Clear cache, load bank
+    memory->clear(false);
+    return set_kv_bank(flat.data(), flat.size(), n_embd_head, n_kv_h);
+}
+
+int32_t llama_set_kv_bank(
+        llama_context * ctx,
+          const float * data,
+               size_t   len,
+              int32_t   n_embd_head,
+              int32_t   n_kv_heads) {
+    bool res = ctx->set_kv_bank(data, len, n_embd_head, n_kv_heads);
+    return res ? 0 : -1;
+}
+
+int32_t llama_inject_memory(
+        llama_context * ctx,
+          const char * memory_text,
+              int32_t   n_layers) {
+    bool res = ctx->inject_memory(memory_text, n_layers);
     return res ? 0 : -1;
 }
 

@@ -861,11 +861,11 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
 //
 
 struct llama_batch llama_batch_get_one(
-             llama_token * tokens,
+             llama_token * token,
                  int32_t   n_tokens) {
     return {
         /*n_tokens =*/ n_tokens,
-        /*tokens   =*/ tokens,
+        /*token    =*/ token,
         /*embd     =*/ nullptr,
         /*pos      =*/ nullptr,
         /*n_seq_id =*/ nullptr,

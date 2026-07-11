@@ -89,3 +89,42 @@ struct llama_adapter_lora {
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
 using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
+
+//
+// llama_kv_bank
+//
+
+struct llama_kv_bank {
+    struct bank_layer {
+        int32_t il = 0;
+        int32_t n_slots = 0;
+
+        // flat float data: [K: n_embd_head * n_kv_heads * n_slots]
+        //                    [V: n_embd_head * n_kv_heads * n_slots]
+        // stored pre-RoPE, pre-WHT (raw float32)
+        std::vector<float> k_data;
+        std::vector<float> v_data;
+
+        // ggml tensors (pre-allocated, one per bank load)
+        // Created in set_kv_bank, consumed by build_kv_bank_injection
+        ggml_tensor * k_tensor = nullptr;
+        ggml_tensor * v_tensor = nullptr;
+    };
+
+    int32_t n_embd_head = 0;  // head_dim del modello (originale, non padded)
+    int32_t n_kv_heads  = 0;  // numero di KV heads
+
+    std::vector<bank_layer> layers;
+
+    // ggml context holding the pre-allocated tensors
+    ggml_context * ctx = nullptr;
+
+    bool has_layer(int il) const {
+        for (auto & l : layers) {
+            if (l.il == il) return true;
+        }
+        return false;
+    }
+};
+
+using llama_kv_bank_ptr = std::shared_ptr<llama_kv_bank>;

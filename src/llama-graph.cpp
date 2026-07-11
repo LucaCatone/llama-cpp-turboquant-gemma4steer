@@ -1058,6 +1058,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
+    n_extra_nodes    (params.n_extra_nodes),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -1065,6 +1066,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    kv_bank          (params.kv_bank),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1085,6 +1087,159 @@ ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
     return cvec->apply_to(ctx0, cur, il);
+}
+
+void llm_graph_context::build_kv_bank_injection(
+        ggml_tensor *& k,
+        ggml_tensor *& v,
+        ggml_tensor *& kq_mask,
+        ggml_tensor *  innerq_scale,
+                int    il,
+        ggml_tensor *  k_rot,
+        ggml_tensor *  v_rot) const {
+    if (!kv_bank || !kv_bank->has_layer(il)) {
+        return;
+    }
+
+    // Find the bank layer
+    const llama_kv_bank::bank_layer * bank = nullptr;
+    for (auto & l : kv_bank->layers) {
+        if (l.il == il) {
+            bank = &l;
+            break;
+        }
+    }
+    if (!bank || bank->n_slots == 0) {
+        return;
+    }
+
+    const int n_slots = bank->n_slots;
+    const int n_kv    = kv_bank->n_kv_heads;
+    const int n_embd  = kv_bank->n_embd_head;
+
+    // k shape: (n_embd_head_k_eff, n_head_kv, n_kv, n_stream)  per KV cache
+    //        o (n_embd_head, n_head, n_tokens) per no-cache
+    // v shape: dipende da v_trans
+    //
+    // Bank tensor shapes (created fresh each time):
+    //   k_bank: (n_embd_head, n_kv, n_slots, 1)
+    //   v_bank: same
+
+    // Use pre-allocated bank tensors (F32, created once in set_kv_bank)
+    const bool is_turbo = (k->type == GGML_TYPE_TURBO3_0 ||
+                           k->type == GGML_TYPE_TURBO4_0 ||
+                           k->type == GGML_TYPE_TURBO2_0);
+
+    ggml_tensor * k_bank = bank->k_tensor;
+    GGML_ASSERT(k_bank != nullptr);
+
+    // Apply k_rot (pre-RoPE canonical) to match cache K rotation
+    if (k_rot) {
+        // k_bank: (n_embd, n_kv, n_slots, 1) → reshape to (n_embd, n_kv * n_slots)
+        int64_t k_nk = k_bank->ne[1];
+        int64_t k_ns = k_bank->ne[2];
+        k_bank = ggml_reshape_2d(ctx0, k_bank, k_bank->ne[0], k_nk * k_ns);
+        k_bank = ggml_mul_mat_aux(ctx0, k_bank, k_rot);
+        k_bank = ggml_reshape_4d(ctx0, k_bank, k_bank->ne[0], k_nk, k_ns, 1);
+    }
+
+    // Cast cache K to F32 for concat (bank is always F32, concat requires same type)
+    ggml_tensor * k_cache_cast = ggml_cast(ctx0, k, GGML_TYPE_F32);
+
+    // If TurboQuant, apply WHT rotation to bank K so it matches the rotated cache K
+    if (is_turbo && innerq_scale) {
+        // Pad bank K head dim to 128-aligned before WHT if needed
+        const int64_t k_head_eff = k->ne[0];
+        const int64_t k_bank_head = k_bank->ne[0];
+        if (k_bank_head != k_head_eff) {
+            // Create padded copy via ggml_pad
+            const int64_t pad = k_head_eff - k_bank_head;
+            k_bank = ggml_pad(ctx0, k_bank, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(k_bank)) { k_bank = ggml_cont(ctx0, k_bank); }
+        k_bank = ggml_turbo_wht(ctx0, k_bank, 0, 0, innerq_scale);
+    } else {
+        // If head dims differ (padded cache vs unpadded bank), pad bank to match
+        const int64_t k_head_eff = k->ne[0];
+        if (k_head_eff != n_embd) {
+            int64_t pad_ne[] = {k_head_eff - n_embd, n_kv, n_slots, 1};
+            ggml_tensor * pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                pad_ne[0], pad_ne[1], pad_ne[2], pad_ne[3]);
+            pad = ggml_fill(ctx0, pad, 0.0f);
+            k_bank = ggml_concat(ctx0, k_bank, pad, 0);
+        }
+    }
+
+    k = ggml_concat(ctx0, k_cache_cast, k_bank, 2);
+
+    // Use pre-allocated V bank tensor
+    const int64_t v_head_eff = hparams.n_embd_head_v(il);
+    const bool v_transposed = (v->ne[0] != v_head_eff && v->ne[0] != (int64_t)n_embd);
+
+    // Cast cache V to F32 for concat
+    ggml_tensor * v_cache_cast = ggml_cast(ctx0, v, GGML_TYPE_F32);
+
+    ggml_tensor * v_bank = bank->v_tensor;
+    GGML_ASSERT(v_bank != nullptr);
+
+    // Apply v_rot (pre-RoPE canonical) to match cache V rotation
+    if (v_rot) {
+        int64_t v_nk = v_bank->ne[1];
+        int64_t v_ns = v_bank->ne[2];
+        v_bank = ggml_reshape_2d(ctx0, v_bank, v_bank->ne[0], v_nk * v_ns);
+        v_bank = ggml_mul_mat_aux(ctx0, v_bank, v_rot);
+        v_bank = ggml_reshape_4d(ctx0, v_bank, v_bank->ne[0], v_nk, v_ns, 1);
+    }
+
+    if (v_transposed) {
+        // v shape: (n_kv_cache, n_kv, head_v, 1)
+        // bank V is (n_embd, n_kv, n_slots, 1), reinterpret as (n_slots, n_kv, n_embd, 1)
+        v_bank = ggml_view_4d(ctx0, v_bank, n_slots, n_kv, n_embd, 1,
+                               v_bank->nb[2], v_bank->nb[1], v_bank->nb[0], 0);
+        // Pad head dim if needed
+        if (v->ne[2] != (int64_t)n_embd && v->ne[2] > (int64_t)n_embd) {
+            int64_t pad_ne[] = {n_slots, n_kv, (int64_t)v->ne[2] - n_embd, 1};
+            ggml_tensor * pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                pad_ne[0], pad_ne[1], pad_ne[2], pad_ne[3]);
+            pad = ggml_fill(ctx0, pad, 0.0f);
+            v_bank = ggml_concat(ctx0, v_bank, pad, 2);
+        }
+        v = ggml_concat(ctx0, v_cache_cast, v_bank, 0);
+    } else {
+        // v shape: (head_v_eff, n_kv, n_kv_cache, 1) — same layout as bank
+        if (v->ne[0] != (int64_t)n_embd && v->ne[0] > (int64_t)n_embd) {
+            int64_t pad_ne[] = {(int64_t)v->ne[0] - n_embd, n_kv, n_slots, 1};
+            ggml_tensor * pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                pad_ne[0], pad_ne[1], pad_ne[2], pad_ne[3]);
+            pad = ggml_fill(ctx0, pad, 0.0f);
+            v_bank = ggml_concat(ctx0, v_bank, pad, 0);
+        }
+        v = ggml_concat(ctx0, v_cache_cast, v_bank, 2);
+    }
+
+    // Extend KQ mask: bank slots are fully visible (mask=0)
+    // kq_mask shape: (n_kv, n_batch, 1, n_stream)
+    // Add n_slots rows of zeros before the existing mask
+    const int32_t n_batch  = kq_mask->ne[1];
+    const int32_t n_stream = kq_mask->ne[3];
+    const bool is_fa = cparams.flash_attn;
+    const auto mask_type = is_fa ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    int64_t ne_mask_bank[] = {n_slots, n_batch, 1, n_stream};
+    ggml_tensor * mask_bank = ggml_new_tensor_4d(ctx0, mask_type,
+        ne_mask_bank[0], ne_mask_bank[1], ne_mask_bank[2], ne_mask_bank[3]);
+    mask_bank = ggml_fill(ctx0, mask_bank, 0.0f);  // 0 = visible
+
+    // Cast mask to match bank mask type if needed
+    ggml_tensor * kq_mask_casted = kq_mask;
+    if (kq_mask->type != mask_type) {
+        kq_mask_casted = ggml_cast(ctx0, kq_mask, mask_type);
+    }
+
+    // Concat bank mask BEFORE existing mask (positions 0..n_slots-1 are bank)
+    // But K has bank AFTER cache: k = concat(k_cache, k_bank, 2)
+    // So mask must also have bank AFTER: concat(kq_mask, mask_bank, 0)
+    kq_mask = ggml_concat(ctx0, kq_mask_casted, mask_bank, 0);
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(
@@ -2374,7 +2529,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    auto kq_mask = inp->get_kq_mask();  // mutable copy for kv_bank injection
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -2383,6 +2538,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    ggml_tensor * innerq_scale = nullptr;
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
@@ -2390,9 +2546,12 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
+
+    // KV bank injection: concat pre-computed K/V slots at selected layers
+    build_kv_bank_injection(k, v, kq_mask, innerq_scale, il, inp->self_k_rot, inp->self_v_rot);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2703,21 +2862,28 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+    auto kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();  // mutable copy
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
+    ggml_tensor * innerq_scale = nullptr;
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
+    }
+
+    // KV bank injection: only on BASE cache (not SWA layers)
+    // For non-SWA layers, mctx_cur = base cache, k/v are from the base
+    if (!is_swa) {
+        build_kv_bank_injection(k, v, kq_mask, innerq_scale, il, k_rot, v_rot);
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);

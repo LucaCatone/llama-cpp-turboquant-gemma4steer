@@ -34,12 +34,14 @@ This fork's TurboQuant integration is used in:
 
 ---
 
-## Patches & Customizations
+## Miro modifications
 
-This fork includes two patches to `cvector-generator` for personalità steering
-via activation vectors on Gemma 4.
+This fork includes all customizations developed for Miro (an AI agent with
+activation steering and KV bank memory on Gemma 4).
 
-### Patch 1: Gemma 4 layer count
+### 1. cvector-generator patches
+
+#### Gemma 4 layer count
 
 `tools/cvector-generator/cvector-generator.cpp`
 
@@ -47,33 +49,74 @@ Gemma 4 26B produces 30 `l_out` tensors instead of `n_layers - 1` (47). The
 original assertion `GGML_ASSERT(diff_filtered.size() == n_layers - 1)` crashes.
 Fix: use `n_layers_actual` (the real count) throughout.
 
-Changes:
-- Allocate `train_context` for `n_layers` instead of `n_layers - 1`
-- Use `diff_filtered.size()` as `n_layers_actual` in `concat_diff_tmp`
-- Resize `v_final` and `v_diff_tmp` after the loop instead of pre-allocating
-- Iterate over `n_layers_actual` in `build_v_diff`
-
-### Patch 2: `--response-only` flag
+#### `--response-only` flag
 
 `common/common.h`, `common/arg.cpp`, `tools/cvector-generator/cvector-generator.cpp`
 
 By default, `cvector-generator` averages hidden state diffs across ALL tokens
-(prompt + response). The user-turn tokens are identical between positive and
-negative pairs, so their diff is ~0 — diluting the signal. The `--response-only`
-flag zeroes out prompt token positions before `filter_nonzero_rows` removes them,
+(prompt + response). The `--response-only` flag zeroes out prompt token positions,
 so only model-response tokens contribute to the mean vector.
 
 Usage:
 ```bash
-llama-cvector-generator \
-  -m model.gguf \
-  --method mean \
-  --response-only \
-  -p positive_prompts.txt \
-  -n negative_prompts.txt \
-  -o control_vector
-.gguf
+llama-cvector-generator -m model.gguf --method mean --response-only \
+  -p positive.txt -n negative.txt -o control_vector.gguf
 ```
+
+### 2. KV bank injection
+
+(Latent-space memory — experimental KV cache manipulation for memory injection.
+
+**Bank creation** (`llama_context::set_kv_bank`):
+- Parses binary data into a `llama_kv_bank` struct with per-layer K/V data
+- Pre-allocates F32 ggml tensors in a dedicated ggml context (one per bank layer)
+- Tensors persist for the lifetime of the bank, avoiding re-creation on graph rebuild
+
+**Injection** (`llm_graph_context::build_kv_bank_injection`):
+Called inside `build_attn()` (overloads for KV cache and ISWA cache), after K and V
+are retrieved from the cache and before `build_attn_mha()`:
+
+1. If a KV bank is loaded and has data for the current layer, the pre-allocated bank
+   K/V tensors are used directly (no `ggml_new_tensor_4d` or `memcpy` during graph build)
+2. Both cache K and V are cast from their native type (F16, TURBO, etc.) to F32 via
+   `ggml_cast` for type-safe `ggml_concat`
+3. Bank K/V are concatenated to cache K/V on the sequence axis via `ggml_concat`
+4. For TurboQuant caches, bank K is WHT-rotated via `ggml_turbo_wht`
+5. V concat axis adapts to `v_trans` layout (transposed vs non-transposed)
+6. The attention mask is extended with zero entries for the bank slots
+7. `sched_reserve()` accounts for extra graph nodes via `n_extra_nodes`
+
+**API:**
+- `llama_set_kv_bank(ctx, data, len, n_embd_head, n_kv_heads)` — load binary bank
+- `llama_inject_memory(ctx, text, n_layers)` — forward text, extract top-k layers by
+  K norm, load as bank, clear cache
+
+**Server endpoints:**
+- `POST /kv-bank` — load bank from JSON (`{"n_embd_head":N,"n_kv_heads":N,"layers":[...]}`)
+- `POST /kv-bank-inject` — forward text and auto-extract
+  (`{"memory":"...","n_layers":5}`)
+
+**Status (2026-07-11):** Functional on SmolLM2-360M. Output differs from baseline
+after injection; clear restores original. Pre-RoPE via `k_rot` matrix for Gemma 4
+architectures works; pre-RoPE via `ggml_rope_ext` for xverse/Llama architectures
+not yet implemented.
+
+**Files changed:**
+| File | Change |
+|---|---|
+| `include/llama.h` | `llama_set_kv_bank()`, `llama_inject_memory()` API |
+| `src/llama-adapter.h` | `llama_kv_bank` struct |
+| `src/llama-context.h` | `kv_bank_ptr`, `set_kv_bank()`, `inject_memory()` |
+| `src/llama-context.cpp` | Parsing, pre-allocation, graph_params, sched_reserve, inject_memory |
+| `src/llama-graph.h` | `kv_bank`, `n_extra_nodes`, `build_kv_bank_injection()` |
+| `src/llama-graph.cpp` | `build_kv_bank_injection()` in two build_attn overloads |
+| `src/llama-kv-cache.h` | `extract_layer_kv()`, `get_layer_k_norm()`, friend |
+| `src/llama-kv-cache.cpp` | Extraction, dequantization, norm computation |
+| `src/llama-batch.cpp` | Fix: `tokens` -> `token` field name |
+| `tools/server/server-task.h` | Task types and data fields |
+| `tools/server/server-context.h` | Handler declarations |
+| `tools/server/server-context.cpp` | Handler implementations |
+| `tools/server/server.cpp` | Route registration |
 
 ---
 
@@ -832,6 +875,39 @@ Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
 automatically. For example:
 ```console
 $ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+```
+
+## Fork modifications (KV bank injection)
+
+This fork adds experimental support for **KV bank injection** — pre-computing key/value pairs from hidden states and concatenating them into the attention computation at selected layers, enabling latent-space memory injection without visible prompt tokens.
+
+### API
+
+```c
+// Load KV bank data into context.
+// data: concatenated float arrays for each layer.
+//   Per-layer format: [il (int32), n_slots (int32),
+//                      k_flat (float[]), v_flat (float[])]
+//   k_flat size: n_embd_head * n_kv_heads * n_slots
+//   v_flat size: n_embd_head * n_kv_heads * n_slots
+// n_embd_head: model head dimension
+// n_kv_heads: number of KV heads (after GQA)
+// Returns 0 on success, -1 on failure.
+LLAMA_API int32_t llama_set_kv_bank(
+        struct llama_context * ctx,
+                 const float * data,
+                      size_t   len,
+                     int32_t   n_embd_head,
+                     int32_t   n_kv_heads);
+// Pass data=NULL to clear.
+
+// Process memory text, extract top-k layers by K norm, load as KV bank.
+// n_layers: how many top layers to select.
+// Clears the KV cache after extraction. Returns 0 on success.
+LLAMA_API int32_t llama_inject_memory(
+        struct llama_context * ctx,
+                 const char * memory_text,
+                     int32_t   n_layers);
 ```
 
 ## Dependencies

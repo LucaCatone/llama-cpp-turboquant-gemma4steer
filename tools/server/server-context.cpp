@@ -758,6 +758,8 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    int inject_memory_result = -1;  // last inject_memory return value, public for HTTP handler
+
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
@@ -2686,6 +2688,33 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+
+            case SERVER_TASK_TYPE_SET_KV_BANK:
+                {
+                    auto & data = task.set_kv_bank_data;
+                    int ret = 0;
+                    if (data.empty()) {
+                        ret = llama_set_kv_bank(ctx_tgt, NULL, 0, 0, 0);
+                    } else {
+                        ret = llama_set_kv_bank(ctx_tgt, data.data(), data.size(),
+                            task.set_kv_bank_embd_head, task.set_kv_bank_kv_heads);
+                    }
+                    (void)ret;
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_INJECT_MEMORY:
+                {
+                    inject_memory_result = llama_inject_memory(ctx_tgt,
+                        task.inject_memory_text.c_str(),
+                        task.inject_n_layers);
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
         }
     }
 
@@ -5069,6 +5098,84 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_kv_bank = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        // Parse: {"n_embd_head": N, "n_kv_heads": N, "layers": [{"il": N, "n_slots": N, "k": [...], "v": [...]}]}
+        // Empty body or empty layers clears the bank
+        if (body.is_null() || body.empty() || !body.contains("layers") || body["layers"].empty()) {
+            auto & rd = res->rd;
+            {
+                server_task task(SERVER_TASK_TYPE_SET_KV_BANK);
+                task.id = rd.get_new_id();
+                // data stays empty -> sends NULL -> clear
+                rd.post_task(std::move(task));
+            }
+            auto result = rd.next(req.should_stop);
+            if (!result) { GGML_ASSERT(req.should_stop()); return res; }
+            res->ok(json::object());
+            return res;
+        }
+
+        int32_t n_embd_head = body.value("n_embd_head", 0);
+        int32_t n_kv_heads  = body.value("n_kv_heads", 0);
+
+        // Flatten into the binary format expected by llama_set_kv_bank
+        std::vector<float> flat;
+        for (auto & layer : body["layers"]) {
+            int32_t il      = layer["il"].get<int32_t>();
+            int32_t n_slots = layer["n_slots"].get<int32_t>();
+            // Store as int32 bit pattern in float array
+            flat.push_back(*(float *)&il);
+            flat.push_back(*(float *)&n_slots);
+            for (auto & v : layer["k"]) flat.push_back(v.get<float>());
+            for (auto & v : layer["v"]) flat.push_back(v.get<float>());
+        }
+
+        // Use task queue for thread safety
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SET_KV_BANK);
+            task.id = rd.get_new_id();
+            task.set_kv_bank_data = std::move(flat);
+            task.set_kv_bank_embd_head = n_embd_head;
+            task.set_kv_bank_kv_heads = n_kv_heads;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) { GGML_ASSERT(req.should_stop()); return res; }
+        if (result->is_error()) { res->error(result->to_json()); return res; }
+        res->ok(json{{"return", 0}});
+        return res;
+    };
+
+    this->post_inject_memory = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        std::string memory = body.value("memory", "");
+        int n_layers = body.value("n_layers", 5);
+        if (memory.empty()) {
+            res->error(format_error_response("missing 'memory' field", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_INJECT_MEMORY);
+            task.id = rd.get_new_id();
+            task.inject_memory_text = memory;
+            task.inject_n_layers = n_layers;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) { GGML_ASSERT(req.should_stop()); return res; }
+        res->ok(json{{"return", ctx_server.inject_memory_result}});
         return res;
     };
 }
