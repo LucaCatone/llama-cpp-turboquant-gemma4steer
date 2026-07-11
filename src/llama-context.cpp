@@ -3926,12 +3926,17 @@ bool llama_context::set_kv_bank(
 
 bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     // 1. Tokenize
+    // Note: llama_tokenize with NULL/0 returns negative count on success (number of tokens needed, negated)
     const llama_vocab * vocab = llama_model_get_vocab(&model);
     int n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), NULL, 0, true, false);
-    if (n_tok <= 0) { LLAMA_LOG_ERROR("%s: tokenization failed\n", __func__); return false; }
+    if (n_tok == std::numeric_limits<int32_t>::min()) {
+        LLAMA_LOG_ERROR("%s: tokenization overflow\n", __func__); return false;
+    }
+    if (n_tok < 0) { n_tok = -n_tok; } else { n_tok = 0; }
+    if (n_tok <= 0) { LLAMA_LOG_ERROR("%s: tokenization failed (empty)\n", __func__); return false; }
     std::vector<llama_token> tokens(n_tok);
-    n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), tokens.data(), n_tok, true, false);
-    if (n_tok <= 0) return false;
+    n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), tokens.data(), tokens.size(), true, false);
+    if (n_tok != (int)tokens.size()) { LLAMA_LOG_ERROR("%s: tokenization size mismatch (%d vs %zu)\n", __func__, n_tok, tokens.size()); return false; }
 
     // 2. Forward pass
     llama_batch batch = llama_batch_get_one(tokens.data(), n_tok);
