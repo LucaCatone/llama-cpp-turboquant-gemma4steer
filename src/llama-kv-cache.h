@@ -227,13 +227,15 @@ public:
 
     // Extract K/V data from a model layer as float arrays.
     // k_out, v_out: caller-allocated buffers (n_embd_head * n_kv_heads * n_slots * sizeof(float))
+    // n_cells: number of sequence positions to extract (0 = extract all from tensor shape).
     // Returns the number of slots extracted, or 0 if layer not found.
     int32_t extract_layer_kv(
             int32_t model_il,
             float * k_out,
             float * v_out,
             int32_t n_embd_head,
-            int32_t n_kv_heads) const;
+            int32_t n_kv_heads,
+            int32_t n_cells = 0) const;
 
     // Get a quick mean(|K|) norm for a model layer (used for layer selection).
     // Returns negative on error, else the mean absolute value of K.

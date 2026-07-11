@@ -1484,7 +1484,8 @@ int32_t llama_kv_cache::extract_layer_kv(
         float * k_out,
         float * v_out,
         int32_t n_embd_head,
-        int32_t n_kv_heads) const {
+        int32_t n_kv_heads,
+        int32_t n_cells) const {
     auto it = map_layer_ids.find(model_il);
     if (it == map_layer_ids.end()) return 0;
     int32_t ikv = it->second;
@@ -1494,7 +1495,12 @@ int32_t llama_kv_cache::extract_layer_kv(
     ggml_tensor * v_t = layers[ikv].v_stream.empty() ? layers[ikv].v : layers[ikv].v_stream[0];
     if (!k_t || !v_t) return 0;
 
-    int32_t n_cells = (int32_t)k_t->ne[2];
+    // Detect layout: collapsed vs separated and compute n_cells from tensor
+    const bool k_collapsed = (k_t->ne[1] > 256);
+    int32_t n_cache_cells = k_collapsed ? (int32_t)k_t->ne[1] : (int32_t)k_t->ne[2];
+    // Use caller's n_cells if provided, otherwise use full cache capacity
+    if (n_cells <= 0 || n_cells > n_cache_cells) n_cells = n_cache_cells;
+
     size_t k_nb = ggml_nbytes(k_t);
     size_t v_nb = ggml_nbytes(v_t);
     std::vector<uint8_t> k_raw(k_nb), v_raw(v_nb);
@@ -1521,25 +1527,37 @@ int32_t llama_kv_cache::extract_layer_kv(
         }
     };
 
-    int k_elems = (int)(k_t->ne[0] * k_t->ne[1] * k_t->ne[2]);
-    int v_elems = (int)(v_t->ne[0] * v_t->ne[1] * (size_t)v_t->ne[2] * v_t->ne[3]);
+    int k_elems = (int)(k_t->ne[0] * k_t->ne[1] * (ggml_n_dims(k_t) >= 3 ? (int)k_t->ne[2] : 1));
+    int v_elems = (int)(v_t->ne[0] * v_t->ne[1] * (ggml_n_dims(v_t) >= 3 ? (int)v_t->ne[2] : 1));
     std::vector<float> k_f32(k_elems), v_f32(v_elems);
     dequant(k_raw, k_t->type, k_f32.data(), k_elems);
     dequant(v_raw, v_t->type, v_f32.data(), v_elems);
 
-    int heff = (int)k_t->ne[0], nkv = (int)k_t->ne[1];
+    // Both layouts share the same linear memory order: h varies fastest, then kv, then seq.
+    const int k_stride_seq = (int)k_t->ne[0];
+    const int k_stride_kv  = n_embd_head;  // h stride between adjacent kv heads
     size_t idx = 0;
-    for (int s = 0; s < n_cells; s++)
-        for (int kv = 0; kv < nkv && kv < n_kv_heads; kv++)
-            for (int h = 0; h < heff && h < n_embd_head; h++)
-                k_out[idx++] = k_f32[h + kv * heff + s * heff * nkv];
-    // V extraction (simplified: same layout)
-    int vhe = (int)v_t->ne[0], vnk = (int)v_t->ne[1];
+    for (int seq = 0; seq < n_cells; seq++) {
+        for (int kv = 0; kv < n_kv_heads; kv++) {
+            for (int h = 0; h < n_embd_head; h++) {
+                int off = h + kv * k_stride_kv + seq * k_stride_seq;
+                k_out[idx++] = k_f32[off];
+            }
+        }
+    }
+
+    // V extraction: same layout
+    const int v_stride_seq = (int)v_t->ne[0];
+    const int v_stride_kv  = n_embd_head;
     size_t vidx = 0;
-    for (int s = 0; s < n_cells; s++)
-        for (int kv = 0; kv < vnk && kv < n_kv_heads; kv++)
-            for (int h = 0; h < vhe && h < n_embd_head; h++)
-                v_out[vidx++] = v_f32[h + kv * vhe + s * vhe * vnk];
+    for (int seq = 0; seq < n_cells; seq++) {
+        for (int kv = 0; kv < n_kv_heads; kv++) {
+            for (int h = 0; h < n_embd_head; h++) {
+                int off = h + kv * v_stride_kv + seq * v_stride_seq;
+                v_out[vidx++] = v_f32[off];
+            }
+        }
+    }
 
     return n_cells;
 }

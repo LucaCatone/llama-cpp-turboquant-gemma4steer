@@ -101,9 +101,12 @@ struct llama_kv_bank {
 
         // flat float data: [K: n_embd_head * n_kv_heads * n_slots]
         //                    [V: n_embd_head * n_kv_heads * n_slots]
-        // stored pre-RoPE, pre-WHT (raw float32)
+        // stored pre-RoPE, pre-WHT (raw float32) by default.
+        // Set already_rotated=true when extracted from cache (post-RoPE)
+        // to skip the rotate transform in build_kv_bank_injection.
         std::vector<float> k_data;
         std::vector<float> v_data;
+        bool already_rotated = false;
 
         // ggml tensors (pre-allocated, one per bank load)
         // Created in set_kv_bank, consumed by build_kv_bank_injection

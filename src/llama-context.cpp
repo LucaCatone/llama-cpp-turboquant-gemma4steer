@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -3952,6 +3953,10 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
         if (hybrid) kv = hybrid->get_mem_attn();
     }
+    if (!kv) {
+        auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+        if (iswa) kv = iswa->get_base();
+    }
     if (!kv) { LLAMA_LOG_ERROR("%s: unsupported memory type\n", __func__); return false; }
 
     int n_cl = kv->get_n_cache_layers();
@@ -3976,7 +3981,9 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         if (it == kv->map_layer_ids.end()) continue;
         int32_t ikv = it->second;
         if (ikv < 0 || ikv >= n_cl) continue;
-        int32_t ns = kv->layers[ikv].k ? (int32_t)kv->layers[ikv].k->ne[2] : 0;
+        ggml_tensor * k_t = kv->layers[ikv].k;
+        if (!k_t) continue;
+        int32_t ns = n_tok;
         if (ns <= 0) continue;
 
         // Get per-layer head dims
@@ -3990,7 +3997,7 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         // Extract + compute norm
         size_t sz = (size_t)nh * nkv_hp * ns;
         std::vector<float> k_buf(sz), v_buf(sz);
-        int got = kv->extract_layer_kv(mil, k_buf.data(), v_buf.data(), nh, nkv_hp);
+        int got = kv->extract_layer_kv(mil, k_buf.data(), v_buf.data(), nh, nkv_hp, ns);
         if (got != ns) continue;
 
         double sum = 0;
@@ -4008,8 +4015,8 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     // 6. Sort by score, take top-n_layers
     std::sort(layers_info.begin(), layers_info.end(),
         [](const LS & a, const LS & b) { return a.score > b.score; });
-    LLAMA_LOG_INFO("%s: %d candidate layers, picking top %d\n", __func__,
-        (int)layers_info.size(), n_layers);
+    LLAMA_LOG_INFO("%s: %d candidate layers (from %d total cache layers), picking top %d\n", __func__,
+        (int)layers_info.size(), n_cl, n_layers);
     for (int i = 0; i < n_layers && i < (int)layers_info.size(); i++) {
         LLAMA_LOG_INFO("  layer %3d score=%8.4f slots=%d\n",
             layers_info[i].il, (double)layers_info[i].score, layers_info[i].n_slots);
@@ -4033,7 +4040,7 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
 
         size_t off = flat.size();
         flat.resize(off + 2 * sz);
-        int got = kv->extract_layer_kv(li.il, flat.data() + off, flat.data() + off + sz, nh, nkv_hp);
+        int got = kv->extract_layer_kv(li.il, flat.data() + off, flat.data() + off + sz, nh, nkv_hp, ns);
         if (got != ns) {
             flat.resize(off - 2);
         }
@@ -4043,9 +4050,14 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
 
     if (flat.empty()) { LLAMA_LOG_ERROR("%s: empty bank\n", __func__); return false; }
 
-    // 8. Clear cache, load bank
-    memory->clear(false);
-    return set_kv_bank(flat.data(), flat.size(), n_embd_head, n_kv_h);
+    // 8. Load bank
+    bool ok = set_kv_bank(flat.data(), flat.size(), n_embd_head, n_kv_h);
+    if (ok && kv_bank) {
+        // Mark all layers as already_rotated (extracted from cache = post-RoPE)
+        // so build_kv_bank_injection skips the k_rot/v_rot rotation
+        for (auto & layer : kv_bank->layers) layer.already_rotated = true;
+    }
+    return ok;
 }
 
 int32_t llama_set_kv_bank(

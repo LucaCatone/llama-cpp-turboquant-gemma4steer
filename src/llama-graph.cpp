@@ -1134,7 +1134,8 @@ void llm_graph_context::build_kv_bank_injection(
     GGML_ASSERT(k_bank != nullptr);
 
     // Apply k_rot (pre-RoPE canonical) to match cache K rotation
-    if (k_rot) {
+    // Skip if bank layers are already rotated (extracted from cache = post-RoPE)
+    if (k_rot && !bank->already_rotated) {
         // k_bank: (n_embd, n_kv, n_slots, 1) → reshape to (n_embd, n_kv * n_slots)
         int64_t k_nk = k_bank->ne[1];
         int64_t k_ns = k_bank->ne[2];
@@ -1147,7 +1148,8 @@ void llm_graph_context::build_kv_bank_injection(
     ggml_tensor * k_cache_cast = ggml_cast(ctx0, k, GGML_TYPE_F32);
 
     // If TurboQuant, apply WHT rotation to bank K so it matches the rotated cache K
-    if (is_turbo && innerq_scale) {
+    // Skip if already rotated (extracted from cache = already WHT-rotated)
+    if (is_turbo && innerq_scale && !bank->already_rotated) {
         // Pad bank K head dim to 128-aligned before WHT if needed
         const int64_t k_head_eff = k->ne[0];
         const int64_t k_bank_head = k_bank->ne[0];
@@ -1183,7 +1185,8 @@ void llm_graph_context::build_kv_bank_injection(
     GGML_ASSERT(v_bank != nullptr);
 
     // Apply v_rot (pre-RoPE canonical) to match cache V rotation
-    if (v_rot) {
+    // Skip if already rotated (extracted from cache = post-RoPE)
+    if (v_rot && !bank->already_rotated) {
         int64_t v_nk = v_bank->ne[1];
         int64_t v_ns = v_bank->ne[2];
         v_bank = ggml_reshape_2d(ctx0, v_bank, v_bank->ne[0], v_nk * v_ns);
