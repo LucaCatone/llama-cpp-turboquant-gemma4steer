@@ -291,6 +291,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
             return new llama_model_eagle3(params);
+        case LLM_ARCH_DFLASH:
+            return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -1264,8 +1266,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         split_sum += splits[i];
         splits[i] = split_sum;
     }
-    for (size_t i = 0; i < n_devices(); ++i) {
-        splits[i] /= split_sum;
+    if (split_sum <= 0.0f) {
+        // all devices reported zero free memory (e.g. a fitted primary model packed
+        // the GPU before a draft model load) - normalizing would produce NaN split
+        // points and an out-of-range device index below. fall back to a uniform split.
+        LLAMA_LOG_WARN("%s: all device split weights are zero, falling back to a uniform split\n", __func__);
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = float(i + 1) / n_devices();
+        }
+    } else {
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] /= split_sum;
+        }
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
@@ -1276,7 +1288,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const int layer_gpu = std::min<int>(
+            std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin(),
+            (int) n_devices() - 1);
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -2489,6 +2503,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_DFLASH:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -2612,7 +2627,8 @@ bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
-        case LLM_ARCH_EAGLE3:    return true;
+        case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }
 }
