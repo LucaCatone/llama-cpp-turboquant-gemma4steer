@@ -4053,8 +4053,8 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     // 8. Load bank
     bool ok = set_kv_bank(flat.data(), flat.size(), n_embd_head, n_kv_h);
     if (ok && kv_bank) {
-        // Mark all layers as already_rotated (extracted from cache = post-RoPE)
-        // so build_kv_bank_injection skips the k_rot/v_rot rotation
+        // Mark layers as already_rotated: skips k_rot/v_rot (RoPE is already applied
+        // in cache K/V) but still applies WHT rotation (cache stores K pre-WHT).
         for (auto & layer : kv_bank->layers) layer.already_rotated = true;
     }
     return ok;

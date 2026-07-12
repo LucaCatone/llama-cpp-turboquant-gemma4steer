@@ -1148,8 +1148,8 @@ void llm_graph_context::build_kv_bank_injection(
     ggml_tensor * k_cache_cast = ggml_cast(ctx0, k, GGML_TYPE_F32);
 
     // If TurboQuant, apply WHT rotation to bank K so it matches the rotated cache K
-    // Skip if already rotated (extracted from cache = already WHT-rotated)
-    if (is_turbo && innerq_scale && !bank->already_rotated) {
+    // Note: cache stores K pre-WHT (WHT is applied on retrieval), so WHT is always needed.
+    if (is_turbo && innerq_scale) {
         // Pad bank K head dim to 128-aligned before WHT if needed
         const int64_t k_head_eff = k->ne[0];
         const int64_t k_bank_head = k_bank->ne[0];
