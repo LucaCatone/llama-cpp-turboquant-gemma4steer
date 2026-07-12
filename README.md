@@ -96,10 +96,30 @@ are retrieved from the cache and before `build_attn_mha()`:
 - `POST /kv-bank-inject` — forward text and auto-extract
   (`{"memory":"...","n_layers":5}`)
 
-**Status (2026-07-11):** Functional on SmolLM2-360M. Output differs from baseline
-after injection; clear restores original. Pre-RoPE via `k_rot` matrix for Gemma 4
-architectures works; pre-RoPE via `ggml_rope_ext` for xverse/Llama architectures
-not yet implemented.
+**Status (2026-07-12):** Functional on SmolLM2-360M and Gemma 4 26B.
+
+- **Multi-dim support:** bank layers can have heterogeneous `n_embd_head`/`n_kv_heads`
+  (required for Gemma 4 ISWA: BASE layers use different dims than SWA layers)
+- **ISWA support:** extraction from both BASE and SWA caches via `get_base()`/`get_swa()`
+- **RoPE:** `k_rot`/`v_rot` transforms always applied (cache stores pre-RoPE K/V)
+- **Gemma 4 requires `--swa-full`:** the 25 SWA layers use sliding window attention
+  (~1024 tokens). If the bank memory text is outside the window, SWA layers
+  cannot attend to it. `--swa-full` forces full-size SWA cache (global attention),
+  adding ~74MB VRAM (negligible on 12GB+ GPUs). Without it, only 5 BASE layers
+  see the bank — insufficient to influence a 26B model with RLHF.
+- Pre-RoPE via `ggml_rope_ext` for xverse/Llama architectures not yet implemented.
+
+**Test results (2026-07-12):**
+
+| Model | `--swa-full` | Baseline | Injected |
+|---|---|---|---|
+| SmolLM2-360M | N/A | "Luca is a data scientist" | "Luca works as a graphic designer" |
+| Gemma 4 26B | **no** | "I have no info about Luca" | "I have no info..." (slightly different) |
+| Gemma 4 26B | **yes** | "I have no info about Luca" | "Based on the text, Luca works as a **graphic designer**" |
+
+`--swa-full` is recommended whenever the model uses ISWA (Interleaved SWA) and
+bank injection is active. The VRAM overhead (~74MB for 25 SWA layers on Gemma 4)
+is negligible on modern GPUs.
 
 **Files changed:**
 | File | Change |
