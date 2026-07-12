@@ -4004,14 +4004,14 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         int32_t mil = (int32_t)kv->layers[i].il;
         extract_and_score(kv, mil);
     }
-    // Extract from SWA cache (if ISWA)
+    // Extract from SWA cache (if ISWA), skip layers already in base
     if (kv_swa) {
         for (int i = 0; i < (int)kv_swa->layers.size(); i++) {
             int32_t mil = (int32_t)kv_swa->layers[i].il;
-            // Skip if already included from base
             bool found = false;
             for (auto & l : layers_info) { if (l.il == mil) { found = true; break; } }
-            if (!found) extract_and_score(kv_swa, mil);
+            if (found) continue;
+            extract_and_score(kv_swa, mil);
         }
     }
 
@@ -4032,7 +4032,8 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     if ((int32_t)layers_info.size() > n_layers)
         layers_info.resize(n_layers);
 
-    // 7. Build flat bank data — determine cache per layer
+    // 7. Build flat bank data — only include layers matching the first layer's dimensions
+    //    (bank requires homogeneous n_embd_head and n_kv_heads across all layers)
     auto cache_for_layer = [&](int32_t mil) -> llama_kv_cache * {
         if (kv_swa && hp.is_swa(mil)) {
             auto it = kv_swa->map_layer_ids.find(mil);
@@ -4041,11 +4042,19 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         return kv;
     };
 
+    int ref_nh = -1, ref_nkv = -1;
     std::vector<float> flat;
     for (auto & li : layers_info) {
         int32_t ns = li.n_slots;
         int nh = (int)hp.n_embd_head_k(li.il);
         int nkv_hp = (int)hp.n_head_kv(li.il);
+
+        // Check dimension consistency
+        if (ref_nh == -1) { ref_nh = nh; ref_nkv = nkv_hp; }
+        if (nh != ref_nh || nkv_hp != ref_nkv) {
+            continue;
+        }
+
         size_t sz = (size_t)nh * nkv_hp * ns;
 
         float f_il, f_ns;
@@ -4060,9 +4069,10 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         int got = cache->extract_layer_kv(li.il, flat.data() + off, flat.data() + off + sz, nh, nkv_hp, ns);
         if (got != ns) {
             flat.resize(off - 2);
+        } else {
+            n_embd_head = nh;
+            n_kv_h = nkv_hp;
         }
-        n_embd_head = nh;
-        n_kv_h = nkv_hp;
     }
 
     if (flat.empty()) { LLAMA_LOG_ERROR("%s: empty bank\n", __func__); return false; }
