@@ -2707,9 +2707,16 @@ private:
 
             case SERVER_TASK_TYPE_INJECT_MEMORY:
                 {
-                    inject_memory_result = llama_inject_memory(ctx_tgt,
-                        task.inject_memory_text.c_str(),
-                        task.inject_n_layers);
+                    if (task.inject_clean) {
+                        inject_memory_result = llama_inject_memory_clean(ctx_tgt,
+                            task.inject_memory_text.c_str(),
+                            task.inject_n_layers,
+                            task.inject_n_ctx_tmp);
+                    } else {
+                        inject_memory_result = llama_inject_memory(ctx_tgt,
+                            task.inject_memory_text.c_str(),
+                            task.inject_n_layers);
+                    }
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
                     queue_results.send(std::move(res));
@@ -5164,12 +5171,21 @@ void server_routes::init_routes() {
             return res;
         }
 
+        bool clean = body.value("clean", false);
+        int n_ctx_tmp = body.value("n_ctx_tmp", 256);
+        if (clean && n_ctx_tmp <= 0) {
+            res->error(format_error_response("invalid 'n_ctx_tmp'", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
         auto & rd = res->rd;
         {
             server_task task(SERVER_TASK_TYPE_INJECT_MEMORY);
             task.id = rd.get_new_id();
             task.inject_memory_text = memory;
             task.inject_n_layers = n_layers;
+            task.inject_clean = clean;
+            task.inject_n_ctx_tmp = n_ctx_tmp;
             rd.post_task(std::move(task));
         }
 

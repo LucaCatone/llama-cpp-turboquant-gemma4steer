@@ -111,6 +111,7 @@ struct llama_kv_bank {
         // Created in set_kv_bank, consumed by build_kv_bank_injection
         ggml_tensor * k_tensor = nullptr;
         ggml_tensor * v_tensor = nullptr;
+        bool no_rotate = false;  // true = skip k_rot/v_rot transforms
     };
 
     int32_t n_embd_head = 0;  // head_dim globale (fallback)
