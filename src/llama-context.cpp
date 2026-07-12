@@ -3947,64 +3947,72 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     free(batch.logits);
     if (ret != 0) { LLAMA_LOG_ERROR("%s: decode failed\n", __func__); return false; }
 
-    // 3. Access KV cache
+    // 3. Access KV cache — try chain: direct → hybrid → iswa
     llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(memory.get());
     if (!kv) {
         auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
         if (hybrid) kv = hybrid->get_mem_attn();
     }
+    // For ISWA (Gemma 4), also collect SWA cache for full layer coverage
+    llama_kv_cache * kv_swa = nullptr;
     if (!kv) {
         auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
-        if (iswa) kv = iswa->get_base();
+        if (iswa) {
+            kv = iswa->get_base();
+            kv_swa = iswa->get_swa();
+        }
     }
     if (!kv) { LLAMA_LOG_ERROR("%s: unsupported memory type\n", __func__); return false; }
 
-    int n_cl = kv->get_n_cache_layers();
-    if (n_cl <= 0) return false;
-
-    // 4. Get model dimensions via model.hparams
     auto & hp = model.hparams;
     int n_embd_head = (int)hp.n_embd_head_k(0);
     int n_kv_h = (int)hp.n_head_kv(0);
 
-    // 5. Extract K/V from all non-SWA layers, compute norm for ranking
+    // 5. Extract K/V from all layers (base + SWA), compute norm for ranking
     struct LS { int32_t il; float score; int32_t n_slots; };
     std::vector<LS> layers_info;
 
-    for (int i = 0; i < n_cl; i++) {
-        int32_t mil = kv->get_cache_layer_il(i);
-        // Skip SWA layers (they usually have different head count)
-        if (hp.is_swa(mil)) continue;
-
-        // Get n_slots from the cache tensor
-        auto it = kv->map_layer_ids.find(mil);
-        if (it == kv->map_layer_ids.end()) continue;
+    auto extract_and_score = [&](llama_kv_cache * cache, int32_t mil) {
+        auto it = cache->map_layer_ids.find(mil);
+        if (it == cache->map_layer_ids.end()) return;
         int32_t ikv = it->second;
-        if (ikv < 0 || ikv >= n_cl) continue;
-        ggml_tensor * k_t = kv->layers[ikv].k;
-        if (!k_t) continue;
+        if (ikv < 0 || ikv >= (int32_t)cache->layers.size()) return;
+        ggml_tensor * k_t = cache->layers[ikv].k;
+        if (!k_t) return;
         int32_t ns = n_tok;
-        if (ns <= 0) continue;
+        if (ns <= 0) return;
 
-        // Get per-layer head dims
         int nh = (int)hp.n_embd_head_k(mil);
         int nkv_hp = (int)hp.n_head_kv(mil);
-        if (nh <= 0 || nkv_hp <= 0) continue;
+        if (nh <= 0 || nkv_hp <= 0) return;
 
         n_embd_head = nh;
         n_kv_h = nkv_hp;
 
-        // Extract + compute norm
         size_t sz = (size_t)nh * nkv_hp * ns;
         std::vector<float> k_buf(sz), v_buf(sz);
-        int got = kv->extract_layer_kv(mil, k_buf.data(), v_buf.data(), nh, nkv_hp, ns);
-        if (got != ns) continue;
+        int got = cache->extract_layer_kv(mil, k_buf.data(), v_buf.data(), nh, nkv_hp, ns);
+        if (got != ns) return;
 
         double sum = 0;
         for (auto x : k_buf) sum += fabs(x);
-        float sc = (float)(sum / k_buf.size());
+        layers_info.push_back({mil, (float)(sum / k_buf.size()), ns});
+    };
 
-        layers_info.push_back({mil, sc, ns});
+    // Extract from base cache
+    for (int i = 0; i < (int)kv->layers.size(); i++) {
+        int32_t mil = (int32_t)kv->layers[i].il;
+        extract_and_score(kv, mil);
+    }
+    // Extract from SWA cache (if ISWA)
+    if (kv_swa) {
+        for (int i = 0; i < (int)kv_swa->layers.size(); i++) {
+            int32_t mil = (int32_t)kv_swa->layers[i].il;
+            // Skip if already included from base
+            bool found = false;
+            for (auto & l : layers_info) { if (l.il == mil) { found = true; break; } }
+            if (!found) extract_and_score(kv_swa, mil);
+        }
     }
 
     if (layers_info.empty()) {
@@ -4015,8 +4023,8 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     // 6. Sort by score, take top-n_layers
     std::sort(layers_info.begin(), layers_info.end(),
         [](const LS & a, const LS & b) { return a.score > b.score; });
-    LLAMA_LOG_INFO("%s: %d candidate layers (from %d total cache layers), picking top %d\n", __func__,
-        (int)layers_info.size(), n_cl, n_layers);
+    LLAMA_LOG_INFO("%s: %d candidate layers, picking top %d\n", __func__,
+        (int)layers_info.size(), n_layers);
     for (int i = 0; i < n_layers && i < (int)layers_info.size(); i++) {
         LLAMA_LOG_INFO("  layer %3d score=%8.4f slots=%d\n",
             layers_info[i].il, (double)layers_info[i].score, layers_info[i].n_slots);
@@ -4024,7 +4032,15 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     if ((int32_t)layers_info.size() > n_layers)
         layers_info.resize(n_layers);
 
-    // 7. Build flat bank data
+    // 7. Build flat bank data — determine cache per layer
+    auto cache_for_layer = [&](int32_t mil) -> llama_kv_cache * {
+        if (kv_swa && hp.is_swa(mil)) {
+            auto it = kv_swa->map_layer_ids.find(mil);
+            if (it != kv_swa->map_layer_ids.end()) return kv_swa;
+        }
+        return kv;
+    };
+
     std::vector<float> flat;
     for (auto & li : layers_info) {
         int32_t ns = li.n_slots;
@@ -4040,7 +4056,8 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
 
         size_t off = flat.size();
         flat.resize(off + 2 * sz);
-        int got = kv->extract_layer_kv(li.il, flat.data() + off, flat.data() + off + sz, nh, nkv_hp, ns);
+        llama_kv_cache * cache = cache_for_layer(li.il);
+        int got = cache->extract_layer_kv(li.il, flat.data() + off, flat.data() + off + sz, nh, nkv_hp, ns);
         if (got != ns) {
             flat.resize(off - 2);
         }
@@ -4050,12 +4067,10 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
 
     if (flat.empty()) { LLAMA_LOG_ERROR("%s: empty bank\n", __func__); return false; }
 
-    // 8. Load bank
+    // 8. Load bank (cache is kept — clearing breaks server slot tracking)
     bool ok = set_kv_bank(flat.data(), flat.size(), n_embd_head, n_kv_h);
     if (ok && kv_bank) {
-        // Mark layers as already_rotated: skips k_rot/v_rot (RoPE is already applied
-        // in cache K/V) but still applies WHT rotation (cache stores K pre-WHT).
-        for (auto & layer : kv_bank->layers) layer.already_rotated = true;
+        sched_reserve();
     }
     return ok;
 }

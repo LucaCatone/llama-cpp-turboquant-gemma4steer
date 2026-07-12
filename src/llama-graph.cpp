@@ -1134,8 +1134,7 @@ void llm_graph_context::build_kv_bank_injection(
     GGML_ASSERT(k_bank != nullptr);
 
     // Apply k_rot (pre-RoPE canonical) to match cache K rotation
-    // Skip if bank layers are already rotated (extracted from cache = post-RoPE)
-    if (k_rot && !bank->already_rotated) {
+    if (k_rot) {
         // k_bank: (n_embd, n_kv, n_slots, 1) → reshape to (n_embd, n_kv * n_slots)
         int64_t k_nk = k_bank->ne[1];
         int64_t k_ns = k_bank->ne[2];
@@ -1147,8 +1146,7 @@ void llm_graph_context::build_kv_bank_injection(
     // Cast cache K to F32 for concat (bank is always F32, concat requires same type)
     ggml_tensor * k_cache_cast = ggml_cast(ctx0, k, GGML_TYPE_F32);
 
-    // If TurboQuant, apply WHT rotation to bank K so it matches the rotated cache K
-    // Note: cache stores K pre-WHT (WHT is applied on retrieval), so WHT is always needed.
+    // If TurboQuant, apply WHT rotation to match the rotated cache K
     if (is_turbo && innerq_scale) {
         // Pad bank K head dim to 128-aligned before WHT if needed
         const int64_t k_head_eff = k->ne[0];
@@ -1185,8 +1183,7 @@ void llm_graph_context::build_kv_bank_injection(
     GGML_ASSERT(v_bank != nullptr);
 
     // Apply v_rot (pre-RoPE canonical) to match cache V rotation
-    // Skip if already rotated (extracted from cache = post-RoPE)
-    if (v_rot && !bank->already_rotated) {
+    if (v_rot) {
         int64_t v_nk = v_bank->ne[1];
         int64_t v_ns = v_bank->ne[2];
         v_bank = ggml_reshape_2d(ctx0, v_bank, v_bank->ne[0], v_nk * v_ns);
@@ -2883,11 +2880,8 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
     }
 
-    // KV bank injection: only on BASE cache (not SWA layers)
-    // For non-SWA layers, mctx_cur = base cache, k/v are from the base
-    if (!is_swa) {
-        build_kv_bank_injection(k, v, kq_mask, innerq_scale, il, k_rot, v_rot);
-    }
+    // KV bank injection: apply to both BASE and SWA layers
+    build_kv_bank_injection(k, v, kq_mask, innerq_scale, il, k_rot, v_rot);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
