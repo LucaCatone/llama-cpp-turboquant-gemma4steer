@@ -726,16 +726,6 @@ extern "C" {
                      const char * memory_text,
                          int32_t   n_layers);
 
-    // Forward memory_text on a temporary context (isolated, clean cache),
-    // extract top-k layers by K norm, load as KV bank on the main context.
-    // n_ctx_tmp: size of the temporary KV cache (256 default; text is truncated if longer).
-    // Returns 0 on success.
-    LLAMA_API int32_t llama_inject_memory_clean(
-            struct llama_context * ctx,
-                     const char * memory_text,
-                         int32_t   n_layers,
-                         int32_t   n_ctx_tmp);
-
     //
     // Memory
     //

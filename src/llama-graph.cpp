@@ -1134,7 +1134,7 @@ void llm_graph_context::build_kv_bank_injection(
     GGML_ASSERT(k_bank != nullptr);
 
     // Apply k_rot (pre-RoPE canonical) to match cache K rotation
-    if (k_rot && !bank->no_rotate) {
+    if (k_rot) {
         // k_bank: (n_embd, n_kv, n_slots, 1) → reshape to (n_embd, n_kv * n_slots)
         int64_t k_nk = k_bank->ne[1];
         int64_t k_ns = k_bank->ne[2];
@@ -1183,7 +1183,7 @@ void llm_graph_context::build_kv_bank_injection(
     GGML_ASSERT(v_bank != nullptr);
 
     // Apply v_rot (pre-RoPE canonical) to match cache V rotation
-    if (v_rot && !bank->no_rotate) {
+    if (v_rot) {
         int64_t v_nk = v_bank->ne[1];
         int64_t v_ns = v_bank->ne[2];
         v_bank = ggml_reshape_2d(ctx0, v_bank, v_bank->ne[0], v_nk * v_ns);

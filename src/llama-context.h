@@ -141,13 +141,6 @@ struct llama_context {
             const char * memory_text,
                 int32_t   n_layers);
 
-    // Same as inject_memory, but runs on a temporary context (clean cache).
-    // n_ctx_tmp: size of the temporary KV cache (text truncated if longer).
-    bool inject_memory_clean(
-            const char * memory_text,
-                int32_t   n_layers,
-                int32_t   n_ctx_tmp);
-
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation

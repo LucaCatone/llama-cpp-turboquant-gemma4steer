@@ -183,8 +183,6 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INJECT_MEMORY
     std::string inject_memory_text;
     int32_t     inject_n_layers = 5;
-    bool        inject_clean = false;
-    int32_t     inject_n_ctx_tmp = 256;
     int32_t     inject_result = -1;
 
     server_task() = default;
