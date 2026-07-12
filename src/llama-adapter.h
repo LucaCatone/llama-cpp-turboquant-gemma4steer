@@ -98,15 +98,14 @@ struct llama_kv_bank {
     struct bank_layer {
         int32_t il = 0;
         int32_t n_slots = 0;
+        int32_t n_embd_head = 0;  // per-layer head dim (0 = use global)
+        int32_t n_kv_heads  = 0;  // per-layer kv heads (0 = use global)
 
         // flat float data: [K: n_embd_head * n_kv_heads * n_slots]
         //                    [V: n_embd_head * n_kv_heads * n_slots]
-        // stored pre-RoPE, pre-WHT (raw float32) by default.
-        // Set already_rotated=true when extracted from cache (post-RoPE)
-        // to skip the rotate transform in build_kv_bank_injection.
+        // stored pre-RoPE, pre-WHT (raw float32).
         std::vector<float> k_data;
         std::vector<float> v_data;
-        bool already_rotated = false;
 
         // ggml tensors (pre-allocated, one per bank load)
         // Created in set_kv_bank, consumed by build_kv_bank_injection
@@ -114,8 +113,8 @@ struct llama_kv_bank {
         ggml_tensor * v_tensor = nullptr;
     };
 
-    int32_t n_embd_head = 0;  // head_dim del modello (originale, non padded)
-    int32_t n_kv_heads  = 0;  // numero di KV heads
+    int32_t n_embd_head = 0;  // head_dim globale (fallback)
+    int32_t n_kv_heads  = 0;  // kv heads globale (fallback)
 
     std::vector<bank_layer> layers;
 

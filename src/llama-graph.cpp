@@ -1114,8 +1114,8 @@ void llm_graph_context::build_kv_bank_injection(
     }
 
     const int n_slots = bank->n_slots;
-    const int n_kv    = kv_bank->n_kv_heads;
-    const int n_embd  = kv_bank->n_embd_head;
+    const int n_embd  = bank->n_embd_head > 0 ? bank->n_embd_head : kv_bank->n_embd_head;
+    const int n_kv    = bank->n_kv_heads  > 0 ? bank->n_kv_heads  : kv_bank->n_kv_heads;
 
     // k shape: (n_embd_head_k_eff, n_head_kv, n_kv, n_stream)  per KV cache
     //        o (n_embd_head, n_head, n_tokens) per no-cache
@@ -1151,7 +1151,7 @@ void llm_graph_context::build_kv_bank_injection(
         // Pad bank K head dim to 128-aligned before WHT if needed
         const int64_t k_head_eff = k->ne[0];
         const int64_t k_bank_head = k_bank->ne[0];
-        if (k_bank_head != k_head_eff) {
+        if (k_bank_head < k_head_eff) {
             // Create padded copy via ggml_pad
             const int64_t pad = k_head_eff - k_bank_head;
             k_bank = ggml_pad(ctx0, k_bank, pad, 0, 0, 0);
@@ -1161,7 +1161,7 @@ void llm_graph_context::build_kv_bank_injection(
     } else {
         // If head dims differ (padded cache vs unpadded bank), pad bank to match
         const int64_t k_head_eff = k->ne[0];
-        if (k_head_eff != n_embd) {
+        if (k_head_eff > n_embd) {
             int64_t pad_ne[] = {k_head_eff - n_embd, n_kv, n_slots, 1};
             ggml_tensor * pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
                 pad_ne[0], pad_ne[1], pad_ne[2], pad_ne[3]);

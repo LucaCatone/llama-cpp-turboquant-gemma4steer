@@ -3865,17 +3865,28 @@ bool llama_context::set_kv_bank(
     while (pos < len) {
         llama_kv_bank::bank_layer layer;
 
-        // Read header: il, n_slots
-        if (pos + 2 > len) {
+        // Read header: il, n_slots, n_embd_head, n_kv_heads
+        if (pos + 4 > len) {
             LLAMA_LOG_ERROR("%s: truncated header\n", __func__);
             return false;
         }
         const int32_t * header = (const int32_t *)(data + pos);
-        layer.il      = header[0];
-        layer.n_slots = header[1];
-        pos += 2;
+        layer.il         = header[0];
+        layer.n_slots    = header[1];
+        layer.n_embd_head = header[2];
+        layer.n_kv_heads  = header[3];
+        pos += 4;
 
-        size_t slot_size = (size_t)n_embd_head * n_kv_heads * layer.n_slots;
+        // Use global as fallback for per-layer dims
+        int32_t l_nh  = layer.n_embd_head > 0 ? layer.n_embd_head : n_embd_head;
+        int32_t l_nkv = layer.n_kv_heads  > 0 ? layer.n_kv_heads  : n_kv_heads;
+        if (l_nh <= 0 || l_nkv <= 0) {
+            LLAMA_LOG_ERROR("%s: invalid dims for layer %d (nh=%d, nkv=%d)\n",
+                __func__, layer.il, l_nh, l_nkv);
+            return false;
+        }
+
+        size_t slot_size = (size_t)l_nh * l_nkv * layer.n_slots;
         if (pos + 2 * slot_size > len) {
             LLAMA_LOG_ERROR("%s: truncated data for layer %d (needs %zu floats, have %zu)\n",
                 __func__, layer.il, 2 * slot_size, len - pos);
@@ -3896,7 +3907,9 @@ bool llama_context::set_kv_bank(
         size_t n_tensors = bank->layers.size() * 2;
         size_t data_bytes = 0;
         for (auto & layer : bank->layers) {
-            data_bytes += (size_t)n_embd_head * n_kv_heads * layer.n_slots * sizeof(float) * 2; // K + V
+            int32_t l_nh  = layer.n_embd_head > 0 ? layer.n_embd_head : n_embd_head;
+            int32_t l_nkv = layer.n_kv_heads  > 0 ? layer.n_kv_heads  : n_kv_heads;
+            data_bytes += (size_t)l_nh * l_nkv * layer.n_slots * sizeof(float) * 2; // K + V
         }
         size_t mem_size = ggml_tensor_overhead() * n_tensors + data_bytes + 4096;
         bank->ctx = ggml_init({mem_size, NULL, /*no_alloc=*/false});
@@ -3905,7 +3918,9 @@ bool llama_context::set_kv_bank(
             return false;
         }
         for (auto & layer : bank->layers) {
-            int64_t ne[] = {n_embd_head, n_kv_heads, layer.n_slots, 1};
+            int32_t l_nh  = layer.n_embd_head > 0 ? layer.n_embd_head : n_embd_head;
+            int32_t l_nkv = layer.n_kv_heads  > 0 ? layer.n_kv_heads  : n_kv_heads;
+            int64_t ne[] = {(int64_t)l_nh, (int64_t)l_nkv, layer.n_slots, 1};
             layer.k_tensor = ggml_new_tensor_4d(bank->ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
             layer.v_tensor = ggml_new_tensor_4d(bank->ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
             if (!layer.k_tensor || !layer.v_tensor) {
@@ -3965,8 +3980,8 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     if (!kv) { LLAMA_LOG_ERROR("%s: unsupported memory type\n", __func__); return false; }
 
     auto & hp = model.hparams;
-    int n_embd_head = (int)hp.n_embd_head_k(0);
-    int n_kv_h = (int)hp.n_head_kv(0);
+    int last_nh = (int)hp.n_embd_head_k(0);
+    int last_nkv = (int)hp.n_head_kv(0);
 
     // 5. Extract K/V from all layers (base + SWA), compute norm for ranking
     struct LS { int32_t il; float score; int32_t n_slots; };
@@ -3986,8 +4001,8 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         int nkv_hp = (int)hp.n_head_kv(mil);
         if (nh <= 0 || nkv_hp <= 0) return;
 
-        n_embd_head = nh;
-        n_kv_h = nkv_hp;
+        last_nh = nh;
+        last_nkv = nkv_hp;
 
         size_t sz = (size_t)nh * nkv_hp * ns;
         std::vector<float> k_buf(sz), v_buf(sz);
@@ -4032,8 +4047,7 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     if ((int32_t)layers_info.size() > n_layers)
         layers_info.resize(n_layers);
 
-    // 7. Build flat bank data — only include layers matching the first layer's dimensions
-    //    (bank requires homogeneous n_embd_head and n_kv_heads across all layers)
+    // 7. Build flat bank data — per-layer n_embd_head and n_kv_heads
     auto cache_for_layer = [&](int32_t mil) -> llama_kv_cache * {
         if (kv_swa && hp.is_swa(mil)) {
             auto it = kv_swa->map_layer_ids.find(mil);
@@ -4042,43 +4056,39 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         return kv;
     };
 
-    int ref_nh = -1, ref_nkv = -1;
     std::vector<float> flat;
     for (auto & li : layers_info) {
         int32_t ns = li.n_slots;
         int nh = (int)hp.n_embd_head_k(li.il);
         int nkv_hp = (int)hp.n_head_kv(li.il);
-
-        // Check dimension consistency
-        if (ref_nh == -1) { ref_nh = nh; ref_nkv = nkv_hp; }
-        if (nh != ref_nh || nkv_hp != ref_nkv) {
-            continue;
-        }
-
         size_t sz = (size_t)nh * nkv_hp * ns;
 
-        float f_il, f_ns;
-        memcpy(&f_il, &li.il, sizeof(float));
-        memcpy(&f_ns, &ns, sizeof(float));
+        float f_il, f_ns, f_nh, f_nkv;
+        memcpy(&f_il,  &li.il,   sizeof(float));
+        memcpy(&f_ns,  &ns,      sizeof(float));
+        memcpy(&f_nh,  &nh,      sizeof(float));
+        memcpy(&f_nkv, &nkv_hp,  sizeof(float));
         flat.push_back(f_il);
         flat.push_back(f_ns);
+        flat.push_back(f_nh);
+        flat.push_back(f_nkv);
 
         size_t off = flat.size();
         flat.resize(off + 2 * sz);
         llama_kv_cache * cache = cache_for_layer(li.il);
         int got = cache->extract_layer_kv(li.il, flat.data() + off, flat.data() + off + sz, nh, nkv_hp, ns);
         if (got != ns) {
-            flat.resize(off - 2);
+            flat.resize(off - 4);
         } else {
-            n_embd_head = nh;
-            n_kv_h = nkv_hp;
+            last_nh = nh;
+            last_nkv = nkv_hp;
         }
     }
 
     if (flat.empty()) { LLAMA_LOG_ERROR("%s: empty bank\n", __func__); return false; }
 
     // 8. Load bank (cache is kept — clearing breaks server slot tracking)
-    bool ok = set_kv_bank(flat.data(), flat.size(), n_embd_head, n_kv_h);
+    bool ok = set_kv_bank(flat.data(), flat.size(), last_nh, last_nkv);
     if (ok && kv_bank) {
         sched_reserve();
     }
