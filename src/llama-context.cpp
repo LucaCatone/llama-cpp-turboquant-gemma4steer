@@ -3954,13 +3954,38 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), tokens.data(), tokens.size(), true, false);
     if (n_tok != (int)tokens.size()) { LLAMA_LOG_ERROR("%s: tokenization size mismatch (%d vs %zu)\n", __func__, n_tok, tokens.size()); return false; }
 
-    // 2. Forward pass
+    // 2. Save conversation state (seq 0), then forward on clean cache
+    //    so memory text K/V are not contaminated by prior context
+    size_t state_size = state_seq_get_size(0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    std::vector<uint8_t> state_buf(state_size);
+    bool state_saved = false;
+    if (state_size > 0) {
+        state_seq_get_data(0, state_buf.data(), state_size, LLAMA_STATE_SEQ_FLAGS_NONE);
+        state_saved = true;
+    }
+    // Remove conversation from cache (leaves clean cache for forward)
+    if (memory) memory->seq_rm(0, -1, -1);
+
+    // Forward memory text on clean cache
     llama_batch batch = llama_batch_get_one(tokens.data(), n_tok);
     batch.logits = (int8_t *)calloc((size_t)n_tok, 1);
     batch.logits[n_tok - 1] = 1;
     int ret = llama_decode(this, batch);
     free(batch.logits);
-    if (ret != 0) { LLAMA_LOG_ERROR("%s: decode failed\n", __func__); return false; }
+    if (ret != 0) {
+        if (memory && state_saved) { memory->seq_rm(0, -1, -1); state_seq_set_data(0, state_buf.data(), state_size, LLAMA_STATE_SEQ_FLAGS_NONE); }
+        LLAMA_LOG_ERROR("%s: decode failed\n", __func__); return false;
+    }
+
+    // Helper: restore conversation and clear memory text from cache
+    // Call this before every early return after state_saved
+    auto restore_conv = [&]() {
+        if (memory && state_saved) {
+            memory->seq_rm(0, -1, -1);
+            state_seq_set_data(0, state_buf.data(), state_size, LLAMA_STATE_SEQ_FLAGS_NONE);
+            state_saved = false;
+        }
+    };
 
     // 3. Access KV cache — try chain: direct → hybrid → iswa
     llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(memory.get());
@@ -4031,6 +4056,7 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     }
 
     if (layers_info.empty()) {
+        restore_conv();
         LLAMA_LOG_ERROR("%s: no valid layers found\n", __func__);
         return false;
     }
@@ -4085,9 +4111,10 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         }
     }
 
-    if (flat.empty()) { LLAMA_LOG_ERROR("%s: empty bank\n", __func__); return false; }
+    if (flat.empty()) { restore_conv(); LLAMA_LOG_ERROR("%s: empty bank\n", __func__); return false; }
 
-    // 8. Load bank (cache is kept — clearing breaks server slot tracking)
+    // Restore conversation before loading bank
+    restore_conv();
     bool ok = set_kv_bank(flat.data(), flat.size(), last_nh, last_nkv);
     if (ok && kv_bank) {
         sched_reserve();
