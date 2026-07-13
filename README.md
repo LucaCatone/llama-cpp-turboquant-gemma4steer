@@ -121,6 +121,28 @@ are retrieved from the cache and before `build_attn_mha()`:
 bank injection is active. The VRAM overhead (~74MB for 25 SWA layers on Gemma 4)
 is negligible on modern GPUs.
 
+**Mid-conversation injection (2026-07-13):** Injection works both at the start
+and mid-conversation. The system saves the conversation state, forwards the
+memory text on a clean cache, extracts K/V, restores the conversation, and
+loads the bank — all transparently via `llama_state_seq_get/set_data`.
+
+**Practical notes:**
+
+- **Single bank, no stacking.** Each `/kv-bank-inject` call replaces the
+  previous bank. To inject multiple facts at once, combine them in a single
+  memory text. The model "spends" injected information in its response — once
+  mentioned, it becomes part of the conversation history and doesn't need the
+  bank anymore.
+
+- **Memory size.** K/V are stored as F32 (RAM, not VRAM). On Gemma 4 (30 layers):
+  - ~5 tokens → ~2.5 MB
+  - ~150 tokens → ~75 MB
+  - ~500 tokens → ~250 MB
+  Practical limit: 50-150 tokens for interactive use (~3s forward time).
+
+- **Workflow:** Agent (Ippocampo) builds a single memory text with all
+  relevant facts, calls `/kv-bank-inject`, done.
+
 **Files changed:**
 | File | Change |
 |---|---|
