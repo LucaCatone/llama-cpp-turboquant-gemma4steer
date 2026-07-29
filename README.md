@@ -109,22 +109,42 @@ are retrieved from the cache and before `build_attn_mha()`:
   see the bank — insufficient to influence a 26B model with RLHF.
 - Pre-RoPE via `ggml_rope_ext` for xverse/Llama architectures not yet implemented.
 
-**Test results (2026-07-12):**
+**Test results:**
 
-| Model | `--swa-full` | Baseline | Injected |
-|---|---|---|---|
-| SmolLM2-360M | N/A | "Luca is a data scientist" | "Luca works as a graphic designer" |
-| Gemma 4 26B | **no** | "I have no info about Luca" | "I have no info..." (slightly different) |
-| Gemma 4 26B | **yes** | "I have no info about Luca" | "Based on the text, Luca works as a **graphic designer**" |
+| Model | `--swa-full` | `no_rotate` | Baseline | Injected |
+|---|---|---|---|---|
+| SmolLM2-360M | N/A | N/A | "Luca is a data scientist" | "Luca works as a graphic designer" |
+| Gemma 4 26B | **no** | N/A | "I have no info about Luca" | "I have no info..." (slightly different) |
+| Gemma 4 26B | **yes** | N/A | "I have no info about Luca" | "Based on the text, Luca works as a **graphic designer**" |
+| Gemma 4 E4B (7.4B) | **yes** | **yes** | "I have no info about Lurin" | "Lurin has **green** hair and violet eyes" |
 
-`--swa-full` is recommended whenever the model uses ISWA (Interleaved SWA) and
+`--swa-full` is required whenever the model uses ISWA (Interleaved SWA) and
 bank injection is active. The VRAM overhead (~74MB for 25 SWA layers on Gemma 4)
 is negligible on modern GPUs.
+
+`no_rotate=true` is required on all models where `inject_memory` forwards
+the memory text on a clean cache (post-RoPE K/V). Without it, `k_rot`/`v_rot`
+are applied twice, distorting the signal.
 
 **Mid-conversation injection (2026-07-13):** Injection works both at the start
 and mid-conversation. The system saves the conversation state, forwards the
 memory text on a clean cache, extracts K/V, restores the conversation, and
 loads the bank — all transparently via `llama_state_seq_get/set_data`.
+
+**RoPE fix — `no_rotate` (2026-07-29):** `inject_memory` forwards the memory
+text on a clean cache (positions 0..n_tok), producing post-RoPE K/V. Without
+`no_rotate=true`, `build_kv_bank_injection` re-applies `k_rot`/`v_rot`,
+doubling the rotation and distorting the signal. The fix:
+- Added `bool no_rotate` to `bank_layer` in `llama-adapter.h`
+- `build_kv_bank_injection` skips rotation if `bank->no_rotate`
+- `inject_memory` sets `no_rotate=true` after `set_kv_bank`
+
+**`--swa-full` required for Gemma 4 E4B (2026-07-29):** On ISWA models
+(Gemma 4), the sliding window cache auto-prunes old tokens. When `/kv-bank-inject`
+clears and restores the cache, the server may force a full prompt re-processing
+that invalidates the bank. `--swa-full` disables SWA pruning (full-size cache),
+at negligible VRAM cost (~74MB for 25 SWA layers on Gemma 4). Verified on
+Gemma 4 E4B (7.4B) and 26B.
 
 **Practical notes:**
 

@@ -4117,6 +4117,7 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     restore_conv();
     bool ok = set_kv_bank(flat.data(), flat.size(), last_nh, last_nkv);
     if (ok && kv_bank) {
+        for (auto & layer : kv_bank->layers) layer.no_rotate = true;
         sched_reserve();
     }
     return ok;
