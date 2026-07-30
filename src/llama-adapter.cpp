@@ -342,11 +342,6 @@ ggml_tensor * llama_adapter_hebbian::apply_to(
     ggml_tensor * active_T   = ggml_cont(ctx, ggml_transpose(ctx, active)); // [count, n_embd] contiguous
     ggml_tensor * retrieved  = ggml_mul_mat(ctx, active_T, sim);             // active_T^T @ sim = active @ sim
 
-    // Normalize by count so alpha is memory-length-independent.
-    // Without this, a 500-token memory produces ~50x stronger retrieval than a 10-token one.
-    float inv_count = 1.0f / (float) count;
-    retrieved = ggml_scale(ctx, retrieved, inv_count);
-
     static int logged_apply = 0;
     if (logged_apply < 3) {
         fprintf(stderr, "HEBB_APPLY: il=%d count=%d n_embd=%d alpha=%.6f cur=(%ld,%ld,%ld) active=(%ld,%ld) sim=(%ld,%ld) retrieved=(%ld,%ld)\n",
