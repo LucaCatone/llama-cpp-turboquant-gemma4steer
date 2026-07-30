@@ -129,6 +129,8 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t post_kv_bank;
     server_http_context::handler_t post_inject_memory;
+    server_http_context::handler_t post_steer_inject;
+    server_http_context::handler_t post_steer_clear;
 
     // to be used in router mode
     json get_model_info() const;

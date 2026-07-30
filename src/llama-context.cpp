@@ -4016,7 +4016,10 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         if (it == cache->map_layer_ids.end()) return;
         int32_t ikv = it->second;
         if (ikv < 0 || ikv >= (int32_t)cache->layers.size()) return;
-        ggml_tensor * k_t = cache->layers[ikv].k;
+        // Use k_stream[0] if available (some architectures store K via stream, not k directly)
+        ggml_tensor * k_t = cache->layers[ikv].k_stream.empty()
+                          ? cache->layers[ikv].k
+                          : cache->layers[ikv].k_stream[0];
         if (!k_t) return;
         int32_t ns = n_tok;
         if (ns <= 0) return;
@@ -4033,9 +4036,13 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         int got = cache->extract_layer_kv(mil, k_buf.data(), v_buf.data(), nh, nkv_hp, ns);
         if (got != ns) return;
 
+        // Score = mean(|K|) * depth_weight
+        // Weighting by layer index prefers semantically richer later layers over early
+        // positional/syntactic ones, which tend to dominate by raw K-norm alone.
         double sum = 0;
         for (auto x : k_buf) sum += fabs(x);
-        layers_info.push_back({mil, (float)(sum / k_buf.size()), ns});
+        const float depth_w = 1.0f + (float)mil / (float)hp.n_layer();
+        layers_info.push_back({mil, (float)(sum / k_buf.size()) * depth_w, ns});
     };
 
     // Extract from base cache
@@ -4065,8 +4072,9 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         [](const LS & a, const LS & b) { return a.score > b.score; });
     LLAMA_LOG_INFO("%s: %d candidate layers, picking top %d\n", __func__,
         (int)layers_info.size(), n_layers);
-    for (int i = 0; i < n_layers && i < (int)layers_info.size(); i++) {
-        LLAMA_LOG_INFO("  layer %3d score=%8.4f slots=%d\n",
+    for (int i = 0; i < (int)layers_info.size(); i++) {
+        LLAMA_LOG_INFO("  [%s] layer %3d score=%8.4f slots=%d\n",
+            i < n_layers ? "selected" : "skipped ",
             layers_info[i].il, (double)layers_info[i].score, layers_info[i].n_slots);
     }
     if ((int32_t)layers_info.size() > n_layers)
@@ -4138,6 +4146,108 @@ int32_t llama_inject_memory(
               int32_t   n_layers) {
     bool res = ctx->inject_memory(memory_text, n_layers);
     return res ? 0 : -1;
+}
+
+bool llama_context::steer_inject_memory(const char * memory_text, float alpha, float scale) {
+    // 1. Tokenize
+    const llama_vocab * vocab = llama_model_get_vocab(&model);
+    int n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), NULL, 0, true, false);
+    if (n_tok == std::numeric_limits<int32_t>::min()) {
+        LLAMA_LOG_ERROR("%s: tokenization overflow\n", __func__); return false;
+    }
+    if (n_tok < 0) { n_tok = -n_tok; } else { n_tok = 0; }
+    if (n_tok <= 0) { LLAMA_LOG_ERROR("%s: tokenization failed (empty)\n", __func__); return false; }
+    std::vector<llama_token> tokens(n_tok);
+    n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), tokens.data(), tokens.size(), true, false);
+    if (n_tok != (int) tokens.size()) { LLAMA_LOG_ERROR("%s: tokenization size mismatch\n", __func__); return false; }
+
+    // 2. Save conversation state
+    size_t state_size = state_seq_get_size(0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    std::vector<uint8_t> state_buf(state_size);
+    bool state_saved = false;
+    if (state_size > 0) {
+        state_seq_get_data(0, state_buf.data(), state_size, LLAMA_STATE_SEQ_FLAGS_NONE);
+        state_saved = true;
+    }
+    if (memory) memory->seq_rm(0, -1, -1);
+
+    auto restore_conv = [&]() {
+        if (memory && state_saved) {
+            memory->seq_rm(0, -1, -1);
+            state_seq_set_data(0, state_buf.data(), state_size, LLAMA_STATE_SEQ_FLAGS_NONE);
+            state_saved = false;
+        }
+    };
+
+    // 3. Enable layer input extraction for all layers
+    for (uint32_t il = 0; il < model.hparams.n_layer(); il++) {
+        set_embeddings_layer_inp(il, true);
+    }
+
+    // 4. Forward memory text on clean cache
+    llama_batch batch = llama_batch_get_one(tokens.data(), n_tok);
+    batch.logits = (int8_t *) calloc((size_t) n_tok, 1);
+    batch.logits[n_tok - 1] = 1;
+    int ret = llama_decode(this, batch);
+    free(batch.logits);
+    if (ret != 0) {
+        for (uint32_t il = 0; il < model.hparams.n_layer(); il++) {
+            set_embeddings_layer_inp(il, false);
+        }
+        restore_conv();
+        LLAMA_LOG_ERROR("%s: decode failed\n", __func__); return false;
+    }
+
+    // 5. Mean pool residual stream across tokens, per layer
+    //    embd_layer_inp[il] = input to layer il = output of layer il-1
+    //    layer 0 is skipped (cvec convention: tensors[0] = nullptr)
+    const int32_t n_embd  = (int32_t) model.hparams.n_embd;
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+
+    std::vector<float> extracted((size_t) n_embd * (n_layer - 1), 0.0f);
+
+    for (int32_t il = 1; il < n_layer; il++) {
+        float * src = get_embeddings_layer_inp((uint32_t) il);
+        if (!src) continue;
+
+        float * dst = extracted.data() + (size_t) n_embd * (il - 1);
+        for (int32_t k = 0; k < n_embd; k++) {
+            float sum = 0.0f;
+            for (int32_t t = 0; t < n_tok; t++) {
+                sum += src[t * n_embd + k];
+            }
+            dst[k] = sum / (float) n_tok;
+        }
+    }
+
+    // 6. Disable layer input extraction
+    for (uint32_t il = 0; il < model.hparams.n_layer(); il++) {
+        set_embeddings_layer_inp(il, false);
+    }
+
+    // 7. Restore conversation
+    restore_conv();
+
+    // 8. Blend into cvec (alpha * old + (1-alpha) * normalize(new) * scale)
+    return cvec->accumulate(model, extracted.data(), extracted.size(), n_embd, 1, n_layer - 1, alpha, scale);
+}
+
+void llama_context::steer_clear() {
+    if (!cvec) { return; }
+    cvec->clear(model);
+}
+
+int32_t llama_steer_inject_memory(
+        llama_context * ctx,
+          const char * memory_text,
+               float   alpha,
+               float   scale) {
+    bool res = ctx->steer_inject_memory(memory_text, alpha, scale);
+    return res ? 0 : -1;
+}
+
+void llama_steer_clear(llama_context * ctx) {
+    ctx->steer_clear();
 }
 
 //

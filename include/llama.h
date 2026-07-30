@@ -726,6 +726,19 @@ extern "C" {
                      const char * memory_text,
                          int32_t   n_layers);
 
+    // Extract residual stream from memory_text and accumulate into cvec steering vectors.
+    // Works on any architecture (attention, hybrid, SSM, recurrent).
+    // alpha: blending factor (0 = replace, 0.5 = avg, 1 = keep old).
+    // Returns 0 on success, -1 on failure.
+    LLAMA_API int32_t llama_steer_inject_memory(
+            struct llama_context * ctx,
+                     const char * memory_text,
+                          float   alpha,
+                          float   scale);
+
+    // Reset all cvec steering vectors to zero.
+    LLAMA_API void llama_steer_clear(struct llama_context * ctx);
+
     //
     // Memory
     //

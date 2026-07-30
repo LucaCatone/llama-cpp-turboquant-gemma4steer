@@ -27,6 +27,21 @@ struct llama_adapter_cvec {
             int32_t il_start,
             int32_t il_end);
 
+    // blend: tensor[il] = alpha * tensor[il] + (1-alpha) * normalize(data[il]) * scale
+    // scale controls steering strength; empirically 2-7 is useful for Gemma-scale models
+    bool accumulate(
+            const llama_model & model,
+            const float * data,
+            size_t len,
+            int32_t n_embd,
+            int32_t il_start,
+            int32_t il_end,
+            float alpha,
+            float scale = 5.0f);
+
+    // zero all tensors and disable (layer_start = layer_end = -1)
+    void clear(const llama_model & model);
+
 private:
     bool init(const llama_model & model);
 

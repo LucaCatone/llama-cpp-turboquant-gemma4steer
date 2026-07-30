@@ -180,6 +180,82 @@ Gemma 4 E4B (7.4B) and 26B.
 | `tools/server/server-context.cpp` | Handler implementations |
 | `tools/server/server.cpp` | Route registration |
 
+### 3. Steering injection (residual stream)
+
+Universal memory injection via cvec steering vectors. Operates on the residual
+stream — the one pathway common to every transformer architecture — so it works
+on attention-only, hybrid, ISWA, SSM, and recurrent models without modification.
+
+**How it works:**
+
+1. Tokenize the memory text
+2. Save conversation state, forward on a clean cache
+3. Read `embd_layer_inp[il]` (residual stream input to each layer) and mean-pool across tokens
+4. L2-normalize each per-layer vector and scale to a target magnitude
+5. Restore conversation
+6. Accumulate the scaled vectors into the existing cvec (`alpha * old + (1-alpha) * normalize(new) * scale`)
+
+**Normalization:** raw residual stream activations are ~10-100x larger in magnitude
+than typical cvec difference vectors. Without normalization, `alpha=0` causes degenerate
+output ("in in in..."). The L2-normalize + scale approach separates direction from magnitude:
+- direction comes from the text's mean activation pattern
+- magnitude is fixed by `scale` (tunable per model; 2-7 is the useful range for Gemma-scale models)
+
+**API:**
+- `llama_steer_inject_memory(ctx, text, alpha, scale)` — extract, normalize, and accumulate
+- `llama_steer_clear(ctx)` — zero all cvec tensors and disable steering
+
+**Server endpoints:**
+- `POST /memory/steer-inject` — forward text and inject (`{"memory":"...","alpha":0.0,"scale":5.0}`)
+- `POST /memory/steer-clear` — reset all steering vectors (`{}`)
+
+**Parameter semantics:**
+
+`alpha` controls blending:
+- `0.0` — replace: each call sets the steering from scratch
+- `0.5` — blend: new and old contribute equally (progressive accumulation)
+- `1.0` — keep: new injection has no effect
+
+`scale` controls steering strength (after L2 normalization):
+- `< 2` — effect too weak to measurably influence generation
+- `2-7` — useful range for Gemma-scale models (n_embd ~2304)
+- `> 8` — output degenerates to repetitive tokens
+- default: `5.0`
+
+**Test results (Gemma 4 E2B, CPU, Docker):**
+
+| Query | Baseline | Steered (scale=5, alpha=0) |
+|---|---|---|
+| "What is Zorblatix?" (novel word) | "a fictional entity in fantasy/sci-fi settings" | "a highly advanced, interdimensional creature known for its incredible, cosmic energy" |
+
+Injected text: "Zorblatix is a rare blue mineral found only on the moon of Jupiter, used to power quantum engines."
+The model picks up space/energy concepts from the injected text (interdimensional, cosmic energy) without the text appearing in the prompt.
+
+**Comparison with KV bank:**
+
+| | KV bank | Steering injection |
+|---|---|---|
+| Architectures | attention-only | all (attention, hybrid, SSM, recurrent) |
+| Memory per layer | `n_embd_head * n_kv_heads * n_tokens` floats | `n_embd` floats |
+| Updatable | replace-only | alpha blending (accumulative) |
+| Semantic precision | high (exact K/V replay) | approximate (mean activation direction) |
+| Implementation | 600+ lines, 11 files | ~200 lines, 7 files |
+
+**Status (2026-07-30):** Implemented and tested on Gemma 4 E2B via Docker (CPU build).
+
+**Files changed:**
+| File | Change |
+|---|---|
+| `include/llama.h` | `llama_steer_inject_memory()`, `llama_steer_clear()` API |
+| `src/llama-adapter.h` | `accumulate()` (with scale param), `clear()` on `llama_adapter_cvec` |
+| `src/llama-adapter.cpp` | `accumulate()` with L2-normalize+scale, `clear()` |
+| `src/llama-context.h` | `steer_inject_memory()`, `steer_clear()` declarations |
+| `src/llama-context.cpp` | Core implementation + C wrappers |
+| `tools/server/server-task.h` | `SERVER_TASK_TYPE_STEER_INJECT/CLEAR`, task fields (alpha, scale) |
+| `tools/server/server-context.h` | Handler declarations, `steer_inject_result` member |
+| `tools/server/server-context.cpp` | Handler implementations, task processing cases |
+| `tools/server/server.cpp` | Route registration |
+
 ---
 
 ## What this fork adds

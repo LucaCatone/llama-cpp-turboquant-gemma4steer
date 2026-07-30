@@ -141,6 +141,17 @@ struct llama_context {
             const char * memory_text,
                 int32_t   n_layers);
 
+    // Extract residual stream from memory_text, accumulate into cvec steering vectors.
+    // alpha: blending factor (0 = replace, 0.5 = avg, 1 = keep old).
+    // scale: steering vector magnitude after L2-normalization (default 20.0).
+    bool steer_inject_memory(
+            const char * memory_text,
+                  float   alpha,
+                  float   scale = 5.0f);
+
+    // Reset all cvec steering vectors to zero and disable.
+    void steer_clear();
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation

@@ -768,7 +768,8 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
-    int inject_memory_result = -1;  // last inject_memory return value, public for HTTP handler
+    int inject_memory_result  = -1;  // last inject_memory return value, public for HTTP handler
+    int steer_inject_result   = -1;  // last steer_inject_memory return value, public for HTTP handler
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -2732,6 +2733,25 @@ private:
                     inject_memory_result = llama_inject_memory(ctx_tgt,
                         task.inject_memory_text.c_str(),
                         task.inject_n_layers);
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_STEER_INJECT:
+                {
+                    steer_inject_result = llama_steer_inject_memory(ctx_tgt,
+                        task.steer_memory_text.c_str(),
+                        task.steer_alpha,
+                        task.steer_scale);
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
+            case SERVER_TASK_TYPE_STEER_CLEAR:
+                {
+                    llama_steer_clear(ctx_tgt);
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
                     queue_results.send(std::move(res));
@@ -5198,6 +5218,51 @@ void server_routes::init_routes() {
         auto result = rd.next(req.should_stop);
         if (!result) { GGML_ASSERT(req.should_stop()); return res; }
         res->ok(json{{"return", ctx_server.inject_memory_result}});
+        return res;
+    };
+
+    this->post_steer_inject = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        std::string memory = body.value("memory", "");
+        float alpha = body.value("alpha", 0.5f);
+        float scale = body.value("scale", 5.0f);
+        if (memory.empty()) {
+            res->error(format_error_response("missing 'memory' field", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_STEER_INJECT);
+            task.id = rd.get_new_id();
+            task.steer_memory_text = memory;
+            task.steer_alpha = alpha;
+            task.steer_scale = scale;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) { GGML_ASSERT(req.should_stop()); return res; }
+        if (result->is_error()) { res->error(result->to_json()); return res; }
+        res->ok(json{{"return", ctx_server.steer_inject_result}});
+        return res;
+    };
+
+    this->post_steer_clear = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_STEER_CLEAR);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) { GGML_ASSERT(req.should_stop()); return res; }
+        if (result->is_error()) { res->error(result->to_json()); return res; }
+        res->ok(json{{"return", 0}});
         return res;
     };
 }

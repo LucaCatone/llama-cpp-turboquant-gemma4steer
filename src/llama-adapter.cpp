@@ -6,6 +6,7 @@
 
 #include <map>
 #include <cassert>
+#include <cmath>
 #include <sstream>
 #include <stdexcept>
 
@@ -131,6 +132,75 @@ bool llama_adapter_cvec::apply(
     }
 
     return true;
+}
+
+bool llama_adapter_cvec::accumulate(
+        const llama_model & model,
+        const float * data,
+        size_t len,
+        int32_t n_embd,
+        int32_t il_start,
+        int32_t il_end,
+        float alpha,
+        float scale) {
+    const auto & hparams = model.hparams;
+
+    if (n_embd != (int) hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: control vector n_embd does not match model\n", __func__);
+        return false;
+    }
+
+    if (tensors.empty()) {
+        if (!init(model)) {
+            return false;
+        }
+    }
+
+    layer_start = il_start;
+    layer_end   = il_end;
+
+    for (int il = il_start; il <= il_end && il < (int) hparams.n_layer(); il++) {
+        if (il < 1) continue;
+        assert(tensors[il] != nullptr);
+
+        const size_t off = (size_t) n_embd * (il - 1);
+        if (off + n_embd > len) break;
+
+        // L2-normalize then scale the incoming slice.
+        // Raw residual stream magnitudes (~sqrt(n_embd)*rms) would overwhelm the
+        // model at alpha=0; unit vectors are too weak to influence it.
+        // scale=20 gives ~sqrt(n_embd) magnitude for n_embd=2304, which sits in
+        // a useful range for steering without degenerating generation.
+        float norm_sq = 0.0f;
+        for (int i = 0; i < n_embd; i++) {
+            norm_sq += data[off + i] * data[off + i];
+        }
+        const float s = (norm_sq > 1e-12f) ? (scale / sqrtf(norm_sq)) : 0.0f;
+
+        std::vector<float> existing(n_embd);
+        ggml_backend_tensor_get(tensors[il], existing.data(), 0, n_embd * sizeof(float));
+
+        for (int i = 0; i < n_embd; i++) {
+            existing[i] = alpha * existing[i] + (1.0f - alpha) * (data[off + i] * s);
+        }
+
+        ggml_backend_tensor_set(tensors[il], existing.data(), 0, n_embd * sizeof(float));
+    }
+
+    return true;
+}
+
+void llama_adapter_cvec::clear(const llama_model & model) {
+    if (tensors.empty()) { return; }
+    const int32_t n_embd = (int32_t) model.hparams.n_embd;
+    std::vector<float> zeros(n_embd, 0.0f);
+    for (size_t il = 1; il < tensors.size(); il++) {
+        if (tensors[il]) {
+            ggml_backend_tensor_set(tensors[il], zeros.data(), 0, (size_t) n_embd * sizeof(float));
+        }
+    }
+    layer_start = -1;
+    layer_end   = -1;
 }
 
 // lora

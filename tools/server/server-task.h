@@ -29,6 +29,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_SET_KV_BANK,
     SERVER_TASK_TYPE_INJECT_MEMORY,
+    SERVER_TASK_TYPE_STEER_INJECT,
+    SERVER_TASK_TYPE_STEER_CLEAR,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -184,6 +186,11 @@ struct server_task {
     std::string inject_memory_text;
     int32_t     inject_n_layers = 5;
     int32_t     inject_result = -1;
+
+    // used by SERVER_TASK_TYPE_STEER_INJECT
+    std::string steer_memory_text;
+    float       steer_alpha = 0.5f;
+    float       steer_scale = 5.0f;
 
     server_task() = default;
 
