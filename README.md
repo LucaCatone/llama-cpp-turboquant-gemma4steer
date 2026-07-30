@@ -327,7 +327,7 @@ POST /memory/hebbian-ingest
 | Gemma 4 E4B (7.4B) | 42 | 2560 | 0.015 | loop → too high ⚠️ |
 
 **Known limitations:**
-- **Alpha depends on memory length**: longer memory → more slots → stronger retrieval → needs lower alpha. To compensate, divide alpha by memory token count manually (e.g. 10-token memory needs alpha ~10x higher than 100-token memory).
+- **Alpha depends on memory length**: longer memory → stronger retrieval. Use lower alpha for longer memories (e.g. 0.01 for 10 tok, 0.005 for 40 tok). Future: `sqrt(n_tok)` normalization.
 - **Alpha depends on model size**: more layers → effects accumulate — E4B needs alpha ~8x smaller than SmolLM2.
 - **Extraction requires sync**: `ggml_backend_tensor_get_async` needs explicit `ggml_backend_synchronize` before copy (2026-07-30 fix in `extract_layer_inputs`).
 
