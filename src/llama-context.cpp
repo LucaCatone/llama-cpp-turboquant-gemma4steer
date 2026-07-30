@@ -3983,6 +3983,9 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         LLAMA_LOG_ERROR("%s: decode failed\n", __func__); return false;
     }
 
+    // Sync backend before reading KV cache — async GPU ops may not have completed
+    synchronize();
+
     // Helper: restore conversation and clear memory text from cache
     // Call this before every early return after state_saved
     auto restore_conv = [&]() {
@@ -4042,6 +4045,16 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
         std::vector<float> k_buf(sz), v_buf(sz);
         int got = cache->extract_layer_kv(mil, k_buf.data(), v_buf.data(), nh, nkv_hp, ns);
         if (got != ns) return;
+
+        // debug
+        static int dbg_kv = 0;
+        if (dbg_kv < 3) {
+            float maxk = 0;
+            for (size_t i = 0; i < sz; i++) if (fabsf(k_buf[i]) > maxk) maxk = fabsf(k_buf[i]);
+            fprintf(stderr, "KV_EXTRACT: il=%d ns=%d got=%d maxk=%.6f first=%.4f %.4f %.4f %.4f %.4f type_k=%d\n",
+                mil, ns, got, maxk, k_buf[0], k_buf[1], k_buf[2], k_buf[3], k_buf[4], (int)k_t->type);
+            dbg_kv++;
+        }
 
         // Score = mean(|K|) * depth_weight
         // Weighting by layer index prefers semantically richer later layers over early
@@ -4131,7 +4144,6 @@ bool llama_context::inject_memory(const char * memory_text, int32_t n_layers) {
     restore_conv();
     bool ok = set_kv_bank(flat.data(), flat.size(), last_nh, last_nkv);
     if (ok && kv_bank) {
-        for (auto & layer : kv_bank->layers) layer.no_rotate = true;
         sched_reserve();
     }
     return ok;
@@ -4308,7 +4320,7 @@ bool llama_context::hebbian_ingest(const char * memory_text, float alpha) {
     }
     fprintf(stderr, "HEBB_INGEST: layers enabled=%d\n", layers_enabled);
 
-    hebbian->alpha = alpha;
+    hebbian->alpha = n_tok > 0 ? alpha * 10.0f / (float) n_tok : alpha;  // auto-scale: user alpha = per-10-tokens strength
     for (int32_t il = 1; il < n_layer; il++) {
         if (!cparams.embeddings_layer_inp[il]) continue; // skip non-enabled
 

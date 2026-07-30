@@ -1106,8 +1106,12 @@ void llm_graph_context::build_kv_bank_injection(
         ggml_tensor *  k_rot,
         ggml_tensor *  v_rot) const {
     if (!kv_bank || !kv_bank->has_layer(il)) {
+        static int dbg_no_layer = 0;
+        if (dbg_no_layer < 5 && kv_bank) { fprintf(stderr, "KV_MISS: il=%d (bank has %zu layers)\n", il, kv_bank->layers.size()); dbg_no_layer++; }
         return;
     }
+    static int dbg_found = 0;
+    if (dbg_found < 5) { fprintf(stderr, "KV_FOUND: il=%d\n", il); dbg_found++; }
 
     // Find the bank layer
     const llama_kv_bank::bank_layer * bank = nullptr;
