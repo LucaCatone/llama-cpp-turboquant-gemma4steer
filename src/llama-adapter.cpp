@@ -277,9 +277,31 @@ bool llama_adapter_hebbian::accumulate(
     int32_t & count  = bank_count[il];
     int32_t & cursor = bank_write_cursor[il];
 
+    // log per il primo layer con dati
+    static int logged_accum = 0;
+    if (logged_accum < 2) {
+        float first = activations[0], last = activations[(n_tokens - 1) * n_embd];
+        fprintf(stderr, "HEBB_ACCUM: il=%d n_tok=%zu n_embd=%d count=%d cursor=%d first=%.6f last=%.6f bank->ne[0]=%ld ne[1]=%ld\n",
+            il, n_tokens, n_embd, count, cursor, first, last, bank->ne[0], bank->ne[1]);
+        logged_accum++;
+    }
+
     for (int32_t t = 0; t < (int32_t) n_tokens; t++) {
-        const float * src      = activations + (size_t) t * n_embd;
+        const float * src_raw = activations + (size_t) t * n_embd;
         const size_t  byte_off = (size_t) cursor * n_embd * sizeof(float);
+
+        // L2-normalize before storing: scale to unit norm
+        float norm = 0.0f;
+        for (int i = 0; i < n_embd; i++) norm += src_raw[i] * src_raw[i];
+        norm = sqrtf(norm) + 1e-8f;
+
+        // On-stack buffer for normalized activations
+        // stack-allocated VLA — fine for n_embd <= 4096
+        float buf[4096];
+        GGML_ASSERT(n_embd <= 4096);
+        for (int i = 0; i < n_embd; i++) buf[i] = src_raw[i] / norm;
+
+        const float * src = buf;
 
         if (count < n_mem) {
             ggml_backend_tensor_set(bank, src, byte_off, (size_t) n_embd * sizeof(float));
@@ -288,9 +310,11 @@ bool llama_adapter_hebbian::accumulate(
             // EWA on the oldest slot
             std::vector<float> slot(n_embd);
             ggml_backend_tensor_get(bank, slot.data(), byte_off, (size_t) n_embd * sizeof(float));
-            for (int i = 0; i < n_embd; i++) {
-                slot[i] = slot[i] * decay + src[i] * (1.0f - decay);
-            }
+            // Normalize the existing slot too before blending
+            float slot_norm = 0.0f;
+            for (int i = 0; i < n_embd; i++) slot_norm += slot[i] * slot[i];
+            slot_norm = sqrtf(slot_norm) + 1e-8f;
+            for (int i = 0; i < n_embd; i++) slot[i] = slot[i] / slot_norm * decay + src[i] * (1.0f - decay);
             ggml_backend_tensor_set(bank, slot.data(), byte_off, (size_t) n_embd * sizeof(float));
         }
         cursor = (cursor + 1) % n_mem;
@@ -317,6 +341,22 @@ ggml_tensor * llama_adapter_hebbian::apply_to(
     // ggml_mul_mat requires first arg contiguous; transpose is not, so ggml_cont first
     ggml_tensor * active_T   = ggml_cont(ctx, ggml_transpose(ctx, active)); // [count, n_embd] contiguous
     ggml_tensor * retrieved  = ggml_mul_mat(ctx, active_T, sim);             // active_T^T @ sim = active @ sim
+
+    // Normalize by count so alpha is memory-length-independent.
+    // Without this, a 500-token memory produces ~50x stronger retrieval than a 10-token one.
+    float inv_count = 1.0f / (float) count;
+    retrieved = ggml_scale(ctx, retrieved, inv_count);
+
+    static int logged_apply = 0;
+    if (logged_apply < 3) {
+        fprintf(stderr, "HEBB_APPLY: il=%d count=%d n_embd=%d alpha=%.6f cur=(%ld,%ld,%ld) active=(%ld,%ld) sim=(%ld,%ld) retrieved=(%ld,%ld)\n",
+            il, count, n_embd, alpha,
+            cur->ne[0], cur->ne[1], cur->ne[2],
+            active->ne[0], active->ne[1],
+            sim->ne[0], sim->ne[1],
+            retrieved->ne[0], retrieved->ne[1]);
+        logged_apply++;
+    }
 
     return ggml_add(ctx, cur, ggml_scale(ctx, retrieved, alpha));
 }

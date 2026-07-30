@@ -303,12 +303,12 @@ LLAMA_API void llama_hebbian_clear(struct llama_context * ctx);
 ```
 
 **Parameters:**
-
-- `alpha`: retrieval strength. Start at `0.01-0.05` and increase. Too high distorts generation; too low has no visible effect.
+- `alpha`: retrieval strength per layer. Start at `0.01` for small models (SmolLM2), `0.005` for large models (Gemma 4 E4B) and tune up. Too high causes token-loop; too low has no visible effect. Effects accumulate across layers — larger models need smaller alphas.
 - `n_mem` (struct field): capacity per layer, default 128 tokens. 64 MB total on Gemma 4 26B (32 layers x 4096 x 128 x 4 bytes).
 - `decay` (struct field): EWA blending when bank is full, default 0.9. Lower = faster forgetting of old tokens.
 
 **Server endpoint:**
+
 ```
 POST /memory/hebbian-ingest
 {
@@ -317,7 +317,25 @@ POST /memory/hebbian-ingest
 }
 ```
 
-**Status (2026-07-30):** Implemented, builds clean on Gemma 4. Not yet tested at runtime — alpha/scale tuning is the expected first work item.
+**Results (2026-07-30):**
+
+| Model | Layers | n_embd | Alpha | Result |
+|---|---|---|---|---|
+| SmolLM2-360M | 32 | 960 | 0.02 | "Lurin hair is a rare and unique color" ✅ correct inference, not exact color |
+| Gemma 4 E4B (7.4B) | 42 | 2560 | 0.008 | "vibrant, bright blue" ✅ correct inference, not exact color |
+| Gemma 4 E4B (7.4B) | 42 | 2560 | 0.01 | "**blue** hair" ✅ effect present, slight color loop risk |
+| Gemma 4 E4B (7.4B) | 42 | 2560 | 0.015 | loop → too high ⚠️ |
+
+**Known limitations:**
+- **Alpha depends on memory length** → **FIXED (2026-07-30):** `apply_to` now normalizes `retrieved` by `1/count`. Alpha is memory-length-independent. Old alpha values must be multiplied by memory token count (e.g. old alpha=0.01 for 10-token memory → new alpha=0.1).
+- **Alpha depends on model size**: more layers → effects accumulate — E4B needs alpha ~8x smaller than SmolLM2.
+- **Extraction requires sync**: `ggml_backend_tensor_get_async` needs explicit `ggml_backend_synchronize` before copy (2026-07-30 fix in `extract_layer_inputs`).
+
+**Implementation details:**
+- **L2 normalization**: activations are L2-normalized before storing in the bank. This prevents norm-dominated retrieval and stabilizes the dot-product similarity.
+- **Async fix**: `extract_layer_inputs` calls `ggml_backend_synchronize(backend)` before the async tensor copy. Without this, copied data was all zeros on both GPU and CPU backends.
+
+**Status (2026-07-30):** Working end-to-end on SmolLM2 and Gemma 4 E4B. Alpha tuning is functional but fragile — future work: auto-scale alpha by `1/count` and per-layer decay.
 
 **Files changed:**
 

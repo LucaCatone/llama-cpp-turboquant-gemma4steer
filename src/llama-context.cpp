@@ -2247,6 +2247,10 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
+
+        // sync before async copy — ensures pending GPU computations complete
+        ggml_backend_synchronize(backend);
+
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
     }
 }
@@ -4294,12 +4298,36 @@ bool llama_context::hebbian_ingest(const char * memory_text, float alpha) {
     //    embd_layer_inp[il] layout: [n_tok x n_embd] (token-major, same as steer_inject_memory)
     const int32_t n_layer = (int32_t) model.hparams.n_layer();
 
+    fprintf(stderr, "HEBB_INGEST: n_tok=%d, n_layer=%d, n_embd=%d\n", n_tok, n_layer, (int) model.hparams.n_embd);
+
+    int layers_with_data  = 0;
+    int layers_with_buffer = 0;
+    int layers_enabled     = 0;
+    for (int32_t il = 1; il < n_layer; il++) {
+        if (cparams.embeddings_layer_inp[il]) layers_enabled++;
+    }
+    fprintf(stderr, "HEBB_INGEST: layers enabled=%d\n", layers_enabled);
+
     hebbian->alpha = alpha;
     for (int32_t il = 1; il < n_layer; il++) {
+        if (!cparams.embeddings_layer_inp[il]) continue; // skip non-enabled
+
         float * src = get_embeddings_layer_inp((uint32_t) il);
-        if (!src) { continue; }
+        if (!src) {
+            layers_with_buffer++;
+            if (layers_with_data < 3) fprintf(stderr, "HEBB_INGEST: layer %d -> buffer not allocated\n", il);
+            continue;
+        }
+        if (layers_with_data < 3) {
+            float maxabs = 0;
+            for (size_t i = 0; i < (size_t) model.hparams.n_embd * n_tok; i++) if (fabsf(src[i]) > maxabs) maxabs = fabsf(src[i]);
+            fprintf(stderr, "HEBB_INGEST: layer %d -> OK, maxabs=%.6f first=%.6f %.6f %.6f %.6f %.6f\n",
+                il, maxabs, src[0], src[1], src[2], src[3], src[4]);
+        }
+        layers_with_data++;
         hebbian->accumulate(model, src, (size_t) n_tok, il);
     }
+    fprintf(stderr, "HEBB_INGEST: done, %d layers with buffer, %d/%d layers had data\n", layers_with_buffer, layers_with_data, layers_enabled);
 
     // 6. Disable layer input extraction
     for (uint32_t il = 0; il < model.hparams.n_layer(); il++) {
