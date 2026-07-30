@@ -57,6 +57,45 @@ private:
 using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;
 
 //
+// llama_adapter_hebbian
+//
+
+struct llama_adapter_hebbian {
+    // capacity per layer (max memory vectors stored)
+    int32_t n_mem  = 128;
+    // retrieval strength: cur += alpha * bank @ sim
+    float   alpha  = 0.05f;
+    // EWA decay when bank is full (0 = replace, 0.9 = slow blend)
+    float   decay  = 0.9f;
+
+    // per-layer filled slot count and next-write cursor
+    std::vector<int32_t> bank_count;
+    std::vector<int32_t> bank_write_cursor;
+
+    // per-layer tensors [n_embd x n_mem] (memory vectors as columns)
+    std::vector<ggml_tensor *> bank_weights;
+
+    std::vector<ggml_context_ptr>           ctxs;
+    std::vector<ggml_backend_buffer_ptr>    bufs;
+
+    // apply Hebbian retrieval to cur at layer il; returns modified cur
+    ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int il) const;
+
+    // accumulate n_tokens activations (layout: [n_tokens x n_embd]) into bank[il]
+    bool accumulate(const llama_model & model, const float * activations,
+                    size_t n_tokens, int il);
+
+    void clear();
+
+private:
+    int32_t n_embd = 0;
+
+    bool init(const llama_model & model);
+};
+
+using llama_adapter_hebbian_ptr = std::shared_ptr<llama_adapter_hebbian>;
+
+//
 // llama_adapter_lora
 //
 

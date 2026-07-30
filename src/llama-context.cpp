@@ -39,6 +39,7 @@ llama_context::llama_context(
               llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
+    hebbian(std::make_unique<llama_adapter_hebbian>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
@@ -2409,12 +2410,14 @@ llm_graph_params llama_context::graph_params(
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
+        /*.hebbian     =*/ hebbian.get(),
         /*.loras       =*/ loras.get(),
         /*.kv_bank     =*/ kv_bank.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_extra_nodes =*/ kv_bank ? (int32_t)(kv_bank->layers.size() * 16) : 0,
+        /*.n_extra_nodes =*/ (kv_bank ? (int32_t)(kv_bank->layers.size() * 16) : 0) +
+                             (hebbian ? (int32_t)(model.hparams.n_layer() * 8) : 0),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -4235,6 +4238,93 @@ bool llama_context::steer_inject_memory(const char * memory_text, float alpha, f
 void llama_context::steer_clear() {
     if (!cvec) { return; }
     cvec->clear(model);
+}
+
+bool llama_context::hebbian_ingest(const char * memory_text, float alpha) {
+    // 1. Tokenize
+    const llama_vocab * vocab = llama_model_get_vocab(&model);
+    int n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), NULL, 0, true, false);
+    if (n_tok == std::numeric_limits<int32_t>::min()) {
+        LLAMA_LOG_ERROR("%s: tokenization overflow\n", __func__); return false;
+    }
+    if (n_tok < 0) { n_tok = -n_tok; } else { n_tok = 0; }
+    if (n_tok <= 0) { LLAMA_LOG_ERROR("%s: tokenization failed (empty)\n", __func__); return false; }
+    std::vector<llama_token> tokens(n_tok);
+    n_tok = llama_tokenize(vocab, memory_text, strlen(memory_text), tokens.data(), tokens.size(), true, false);
+    if (n_tok != (int) tokens.size()) { LLAMA_LOG_ERROR("%s: tokenization size mismatch\n", __func__); return false; }
+
+    // 2. Save conversation state
+    size_t state_size = state_seq_get_size(0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    std::vector<uint8_t> state_buf(state_size);
+    bool state_saved = false;
+    if (state_size > 0) {
+        state_seq_get_data(0, state_buf.data(), state_size, LLAMA_STATE_SEQ_FLAGS_NONE);
+        state_saved = true;
+    }
+    if (memory) memory->seq_rm(0, -1, -1);
+
+    auto restore_conv = [&]() {
+        if (memory && state_saved) {
+            memory->seq_rm(0, -1, -1);
+            state_seq_set_data(0, state_buf.data(), state_size, LLAMA_STATE_SEQ_FLAGS_NONE);
+            state_saved = false;
+        }
+    };
+
+    // 3. Enable layer input extraction for all layers
+    for (uint32_t il = 0; il < model.hparams.n_layer(); il++) {
+        set_embeddings_layer_inp(il, true);
+    }
+
+    // 4. Forward memory text on clean cache
+    llama_batch batch = llama_batch_get_one(tokens.data(), n_tok);
+    batch.logits = (int8_t *) calloc((size_t) n_tok, 1);
+    batch.logits[n_tok - 1] = 1;
+    int ret = llama_decode(this, batch);
+    free(batch.logits);
+    if (ret != 0) {
+        for (uint32_t il = 0; il < model.hparams.n_layer(); il++) {
+            set_embeddings_layer_inp(il, false);
+        }
+        restore_conv();
+        LLAMA_LOG_ERROR("%s: decode failed\n", __func__); return false;
+    }
+
+    // 5. Per layer, accumulate per-token activations into the Hebbian bank
+    //    embd_layer_inp[il] layout: [n_tok x n_embd] (token-major, same as steer_inject_memory)
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+
+    hebbian->alpha = alpha;
+    for (int32_t il = 1; il < n_layer; il++) {
+        float * src = get_embeddings_layer_inp((uint32_t) il);
+        if (!src) { continue; }
+        hebbian->accumulate(model, src, (size_t) n_tok, il);
+    }
+
+    // 6. Disable layer input extraction
+    for (uint32_t il = 0; il < model.hparams.n_layer(); il++) {
+        set_embeddings_layer_inp(il, false);
+    }
+
+    // 7. Restore conversation
+    restore_conv();
+    return true;
+}
+
+void llama_context::hebbian_clear() {
+    if (!hebbian) { return; }
+    hebbian->clear();
+}
+
+int32_t llama_hebbian_ingest(
+        llama_context * ctx,
+          const char * memory_text,
+               float   alpha) {
+    return ctx->hebbian_ingest(memory_text, alpha) ? 0 : -1;
+}
+
+void llama_hebbian_clear(llama_context * ctx) {
+    ctx->hebbian_clear();
 }
 
 int32_t llama_steer_inject_memory(

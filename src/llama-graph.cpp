@@ -1065,6 +1065,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
+    hebbian          (params.hebbian),
     loras            (params.loras),
     kv_bank          (params.kv_bank),
     mctx             (params.mctx),
@@ -1087,6 +1088,13 @@ ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
     return cvec->apply_to(ctx0, cur, il);
+}
+
+ggml_tensor * llm_graph_context::build_hebbian(
+         ggml_tensor * cur,
+                 int   il) const {
+    if (!hebbian) { return cur; }
+    return hebbian->apply_to(ctx0, cur, il);
 }
 
 void llm_graph_context::build_kv_bank_injection(

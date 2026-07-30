@@ -739,6 +739,17 @@ extern "C" {
     // Reset all cvec steering vectors to zero.
     LLAMA_API void llama_steer_clear(struct llama_context * ctx);
 
+    // Extract residual stream from memory_text and store per-token activations in the Hebbian bank.
+    // alpha: retrieval strength added to the residual stream at each layer (start with 0.01-0.05).
+    // Returns 0 on success, -1 on failure.
+    LLAMA_API int32_t llama_hebbian_ingest(
+            struct llama_context * ctx,
+                     const char * memory_text,
+                          float   alpha);
+
+    // Clear all Hebbian banks (resets the stored memory).
+    LLAMA_API void llama_hebbian_clear(struct llama_context * ctx);
+
     //
     // Memory
     //

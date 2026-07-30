@@ -599,6 +599,7 @@ struct llm_graph_params {
     ggml_backend_t backend_cpu;
 
     const llama_adapter_cvec     * cvec;
+    const llama_adapter_hebbian  * hebbian;
     const llama_adapter_loras    * loras;
     const llama_kv_bank          * kv_bank;
     const llama_memory_context_i * mctx;
@@ -691,6 +692,7 @@ struct llm_graph_params {
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec        == other.cvec        &&
+            hebbian     == other.hebbian     &&
             loras       == other.loras       &&
             kv_bank     == other.kv_bank     &&
             n_extra_nodes == other.n_extra_nodes &&
@@ -827,6 +829,7 @@ struct llm_graph_context {
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
     const llama_adapter_cvec     * cvec;
+    const llama_adapter_hebbian  * hebbian;
     const llama_adapter_loras    * loras;
     const llama_kv_bank          * kv_bank;
     const llama_memory_context_i * mctx;
@@ -851,6 +854,10 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_cvec(
+             ggml_tensor * cur,
+                     int   il) const;
+
+    ggml_tensor * build_hebbian(
              ggml_tensor * cur,
                      int   il) const;
 

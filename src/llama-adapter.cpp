@@ -203,6 +203,132 @@ void llama_adapter_cvec::clear(const llama_model & model) {
     layer_end   = -1;
 }
 
+// hebbian
+
+bool llama_adapter_hebbian::init(const llama_model & model) {
+    const auto & hparams = model.hparams;
+    const int32_t n_layer_total = (int32_t) hparams.n_layer();
+    n_embd = (int32_t) hparams.n_embd;
+
+    GGML_ASSERT(bank_weights.empty());
+    GGML_ASSERT(ctxs.empty());
+    GGML_ASSERT(bufs.empty());
+
+    bank_count.assign(n_layer_total, 0);
+    bank_write_cursor.assign(n_layer_total, 0);
+    bank_weights.resize(n_layer_total, nullptr);
+
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ (size_t) n_layer_total * ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) { return nullptr; }
+            ctx_map[buft] = ctx;
+            ctxs.emplace_back(ctx);
+            return ctx;
+        }
+        return it->second;
+    };
+
+    // layer 0 skipped (no tensor, consistent with cvec convention)
+    for (int il = 1; il < n_layer_total; il++) {
+        ggml_backend_buffer_type_t buft = model.select_buft(il);
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to allocate context\n", __func__);
+            return false;
+        }
+        bank_weights[il] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_mem);
+    }
+
+    bufs.reserve(ctx_map.size());
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate buffer\n", __func__);
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        bufs.emplace_back(buf);
+    }
+
+    return true;
+}
+
+bool llama_adapter_hebbian::accumulate(
+        const llama_model & model,
+        const float * activations,
+        size_t n_tokens,
+        int il) {
+    if (bank_weights.empty()) {
+        if (!init(model)) { return false; }
+    }
+    if (il < 1 || il >= (int) bank_weights.size()) { return false; }
+
+    ggml_tensor * bank = bank_weights[il];
+    if (!bank) { return false; }
+
+    int32_t & count  = bank_count[il];
+    int32_t & cursor = bank_write_cursor[il];
+
+    for (int32_t t = 0; t < (int32_t) n_tokens; t++) {
+        const float * src      = activations + (size_t) t * n_embd;
+        const size_t  byte_off = (size_t) cursor * n_embd * sizeof(float);
+
+        if (count < n_mem) {
+            ggml_backend_tensor_set(bank, src, byte_off, (size_t) n_embd * sizeof(float));
+            count++;
+        } else {
+            // EWA on the oldest slot
+            std::vector<float> slot(n_embd);
+            ggml_backend_tensor_get(bank, slot.data(), byte_off, (size_t) n_embd * sizeof(float));
+            for (int i = 0; i < n_embd; i++) {
+                slot[i] = slot[i] * decay + src[i] * (1.0f - decay);
+            }
+            ggml_backend_tensor_set(bank, slot.data(), byte_off, (size_t) n_embd * sizeof(float));
+        }
+        cursor = (cursor + 1) % n_mem;
+    }
+    return true;
+}
+
+ggml_tensor * llama_adapter_hebbian::apply_to(
+        ggml_context * ctx, ggml_tensor * cur, int il) const {
+    if (il < 1 || il >= (int) bank_weights.size()) { return cur; }
+    ggml_tensor * bank    = bank_weights[il];
+    const int32_t count   = bank_count[il];
+    if (!bank || count == 0) { return cur; }
+
+    // active: view of filled slots [n_embd x count]
+    ggml_tensor * active = ggml_view_2d(ctx, bank, n_embd, count, bank->nb[1], 0);
+
+    // sim = active^T @ cur -> [count, n_tok]
+    // ggml_mul_mat(A, B) = A^T @ B; A.ne[0] must match B.ne[0]
+    // active: ne[0]=n_embd; cur: ne[0]=n_embd -> OK; result: [count, n_tok]
+    ggml_tensor * sim = ggml_mul_mat(ctx, active, cur);
+
+    // retrieved = active @ sim -> [n_embd, n_tok]
+    // ggml_mul_mat requires first arg contiguous; transpose is not, so ggml_cont first
+    ggml_tensor * active_T   = ggml_cont(ctx, ggml_transpose(ctx, active)); // [count, n_embd] contiguous
+    ggml_tensor * retrieved  = ggml_mul_mat(ctx, active_T, sim);             // active_T^T @ sim = active @ sim
+
+    return ggml_add(ctx, cur, ggml_scale(ctx, retrieved, alpha));
+}
+
+void llama_adapter_hebbian::clear() {
+    for (auto & buf : bufs) {
+        ggml_backend_buffer_clear(buf.get(), 0);
+    }
+    std::fill(bank_count.begin(),        bank_count.end(),        0);
+    std::fill(bank_write_cursor.begin(), bank_write_cursor.end(), 0);
+}
+
 // lora
 
 llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {

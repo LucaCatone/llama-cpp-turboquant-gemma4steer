@@ -152,6 +152,13 @@ struct llama_context {
     // Reset all cvec steering vectors to zero and disable.
     void steer_clear();
 
+    // Extract residual stream from memory_text, store per-token activations in the Hebbian bank.
+    // alpha: retrieval strength (how much the retrieved signal is added to the residual stream).
+    bool hebbian_ingest(const char * memory_text, float alpha = 0.05f);
+
+    // Reset all Hebbian banks to zero.
+    void hebbian_clear();
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
@@ -299,9 +306,10 @@ private:
 
     llama_cparams cparams;
 
-    llama_adapter_cvec_ptr  cvec;
-    llama_adapter_loras_ptr loras;
-    llama_kv_bank_ptr       kv_bank;
+    llama_adapter_cvec_ptr    cvec;
+    llama_adapter_hebbian_ptr hebbian;
+    llama_adapter_loras_ptr   loras;
+    llama_kv_bank_ptr         kv_bank;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
