@@ -256,6 +256,105 @@ The model picks up space/energy concepts from the injected text (interdimensiona
 | `tools/server/server-context.cpp` | Handler implementations, task processing cases |
 | `tools/server/server.cpp` | Route registration |
 
+### 4. Hebbian fast-weight memory (residual stream)
+
+Associative memory injection via per-layer activation banks. Stores per-token residual stream activations from a memory text and retrieves them at inference time via linear attention — without occupying any context tokens.
+
+**How it works:**
+
+1. Tokenize the memory text
+2. Save conversation state, forward on a clean cache with layer-input extraction enabled
+3. For each layer, store each token's activation vector into a per-layer bank (`n_embd x n_mem` matrix, memory vectors as columns)
+4. Restore conversation
+5. At every subsequent forward pass, for each layer: compute dot-product similarities between the bank and the current residual stream, then add back the weighted sum of stored activations
+
+Mathematically:
+```
+sim      = bank^T @ cur        # [n_mem, n_tok] similarities
+retrieved = bank @ sim          # [n_embd, n_tok] weighted recall
+cur      += alpha * retrieved
+```
+
+This is **linear attention over stored activations** — token-specific retrieval, not a mean, so irrelevant memories contribute ~0.
+
+**Difference from steering injection:**
+
+| | Steering (cvec) | Hebbian bank |
+|---|---|---|
+| What's stored | Mean activation direction per layer | Per-token activation vectors per layer |
+| Retrieval | Constant add at every step | Similarity-weighted recall — selective |
+| Memory footprint | `n_embd` floats/layer | `n_embd x n_mem` floats/layer (64 MB at n_mem=128) |
+| Token sensitivity | None (mean loses token identity) | High — "Fossanera" retrieves "Fossanera" activations |
+| Architectures | All | All (residual stream is universal) |
+
+**API:**
+
+```c
+// Forward memory_text, store per-token activations in the Hebbian bank.
+// alpha: retrieval strength added to residual stream (start with 0.01-0.05).
+// Returns 0 on success, -1 on failure.
+LLAMA_API int32_t llama_hebbian_ingest(
+        struct llama_context * ctx,
+                 const char * memory_text,
+                      float   alpha);
+
+// Clear all Hebbian banks (reset stored memory).
+LLAMA_API void llama_hebbian_clear(struct llama_context * ctx);
+```
+
+**Parameters:**
+
+- `alpha`: retrieval strength. Start at `0.01-0.05` and increase. Too high distorts generation; too low has no visible effect.
+- `n_mem` (struct field): capacity per layer, default 128 tokens. 64 MB total on Gemma 4 26B (32 layers x 4096 x 128 x 4 bytes).
+- `decay` (struct field): EWA blending when bank is full, default 0.9. Lower = faster forgetting of old tokens.
+
+**Server endpoint:**
+```
+POST /memory/hebbian-ingest
+{
+  "memory": "Lurin is my best friend. We fought together at Fossanera.",
+  "alpha": 0.05
+}
+```
+
+**Status (2026-07-30):** Implemented, builds clean on Gemma 4. Not yet tested at runtime — alpha/scale tuning is the expected first work item.
+
+**Files changed:**
+
+| File | Change |
+|---|---|
+| `include/llama.h` | `llama_hebbian_ingest()`, `llama_hebbian_clear()` API |
+| `src/llama-adapter.h` | `llama_adapter_hebbian` struct |
+| `src/llama-adapter.cpp` | `init()`, `accumulate()`, `apply_to()`, `clear()` |
+| `src/llama-context.h` | `hebbian` member, `hebbian_ingest()`, `hebbian_clear()` |
+| `src/llama-context.cpp` | Implementation, C wrappers, graph_params, constructor |
+| `src/llama-graph.h` | `hebbian` in `llm_graph_params` / `llm_graph_context`, `build_hebbian()` |
+| `src/llama-graph.cpp` | `build_hebbian()` implementation |
+| `src/models/gemma4.cpp` | `cur = build_hebbian(cur, il)` after `build_cvec` (currently only gemma4 — see below) |
+| `tools/server/server-task.h` | `SERVER_TASK_TYPE_HEBBIAN_INGEST`, `hebbian_memory_text`, `hebbian_alpha` |
+| `tools/server/server-context.h` | `post_hebbian_ingest` handler declaration |
+| `tools/server/server-context.cpp` | HTTP handler + task dispatch case |
+| `tools/server/server.cpp` | Route `POST /memory/hebbian-ingest` |
+
+**Enabling Hebbian on other model architectures:**
+
+The Hebbian retrieval hook is currently wired only into `src/models/gemma4.cpp`. To enable it for another architecture, find the end of the per-layer loop in the model's `.cpp` file and add one line after `build_cvec`:
+
+```cpp
+// before (already present):
+cur = build_cvec(cur, il);
+
+// add:
+cur = build_hebbian(cur, il);
+```
+
+`build_hebbian` is a no-op if no memory has been ingested (`bank_count[il] == 0`), so adding the line has zero runtime cost when the bank is empty. The function is declared in `src/llama-graph.h` and available in all model graph contexts.
+
+**References:**
+- Schlag, Irie, Schmidhuber (2021) — *Linear Transformers Are Secretly Fast Weight Programmers* (arXiv:2102.11174)
+- Ba, Hinton et al. (2016) — *Using Fast Weights to Attend to the Recent Past* (NIPS 2016)
+- Schmidhuber (1992) — *Learning to Control Fast-Weight Memories* (Neural Computation 4(1))
+
 ---
 
 ## What this fork adds

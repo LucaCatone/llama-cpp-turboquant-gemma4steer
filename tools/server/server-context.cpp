@@ -2738,6 +2738,16 @@ private:
                     queue_results.send(std::move(res));
                 } break;
 
+            case SERVER_TASK_TYPE_HEBBIAN_INGEST:
+                {
+                    inject_memory_result = (int32_t) llama_hebbian_ingest(ctx_tgt,
+                        task.hebbian_memory_text.c_str(),
+                        task.hebbian_alpha);
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+
             case SERVER_TASK_TYPE_STEER_INJECT:
                 {
                     steer_inject_result = llama_steer_inject_memory(ctx_tgt,
@@ -5263,6 +5273,29 @@ void server_routes::init_routes() {
         if (!result) { GGML_ASSERT(req.should_stop()); return res; }
         if (result->is_error()) { res->error(result->to_json()); return res; }
         res->ok(json{{"return", 0}});
+        return res;
+    };
+
+    this->post_hebbian_ingest = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        std::string memory = body.value("memory", "");
+        float alpha = body.value("alpha", 0.05f);
+        if (memory.empty()) {
+            res->error(format_error_response("missing 'memory' field", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        server_task task(SERVER_TASK_TYPE_HEBBIAN_INGEST);
+        task.id = rd.get_new_id();
+        task.hebbian_memory_text = memory;
+        task.hebbian_alpha = alpha;
+        rd.post_task(std::move(task));
+
+        auto result = rd.next(req.should_stop);
+        if (!result) { GGML_ASSERT(req.should_stop()); return res; }
+        res->ok(json{{"return", ctx_server.inject_memory_result}});
         return res;
     };
 }

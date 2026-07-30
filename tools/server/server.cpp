@@ -239,6 +239,7 @@ int llama_server(int argc, char ** argv) {
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     ctx_http.post("/kv-bank",                  ex_wrapper(routes.post_kv_bank));
     ctx_http.post("/kv-bank-inject",           ex_wrapper(routes.post_inject_memory));
+    ctx_http.post("/memory/hebbian-ingest",    ex_wrapper(routes.post_hebbian_ingest));
     ctx_http.post("/memory/steer-inject",      ex_wrapper(routes.post_steer_inject));
     ctx_http.post("/memory/steer-clear",       ex_wrapper(routes.post_steer_clear));
     // Save & load slots

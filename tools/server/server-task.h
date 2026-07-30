@@ -29,6 +29,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_SET_KV_BANK,
     SERVER_TASK_TYPE_INJECT_MEMORY,
+    SERVER_TASK_TYPE_HEBBIAN_INGEST,
     SERVER_TASK_TYPE_STEER_INJECT,
     SERVER_TASK_TYPE_STEER_CLEAR,
 };
@@ -184,7 +185,11 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_INJECT_MEMORY
     std::string inject_memory_text;
-    int32_t     inject_n_layers = 5;
+    int32_t inject_n_layers = 5;
+
+    // used by SERVER_TASK_TYPE_HEBBIAN_INGEST
+    std::string hebbian_memory_text;
+    float hebbian_alpha = 0.05f;
     int32_t     inject_result = -1;
 
     // used by SERVER_TASK_TYPE_STEER_INJECT

@@ -131,6 +131,7 @@ struct server_routes {
     server_http_context::handler_t post_inject_memory;
     server_http_context::handler_t post_steer_inject;
     server_http_context::handler_t post_steer_clear;
+    server_http_context::handler_t post_hebbian_ingest;
 
     // to be used in router mode
     json get_model_info() const;
